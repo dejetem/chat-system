@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/chat-node",
+    "crates/auth", 
+    "crates/cluster", 
+    "crates/protocol", 
+    "crates/pubsub", 
+    "crates/server", 
+    "crates/storage"
+]
