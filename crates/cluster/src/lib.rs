@@ -1,14 +1,23 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+// use std::env;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// #[derive(Clone, Debug)]
+// pub struct NodeInfo {
+//     pub node_id: String,
+//     pub region: String,
+//     pub port: u16,
+//     pub timestamp: u64,
+// }
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+// impl NodeInfo {
+//     pub fn new(port: u16, node_id: String, region: String, timestamp: u64) -> Self {
+//         Self {
+//             node_id,
+//             region,
+//             port,
+//             timestamp,
+//         }
+//     }
+// }
+
+pub mod node;
+pub use node::NodeInfo;
