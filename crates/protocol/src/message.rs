@@ -1,7 +1,7 @@
 // This becomes the central protocol abstraction.
-use crate::{MessageType, ProtocolError};
-use crate::payloads::*;
 use crate::binary::{BinarySerializable, ProtocolMessage};
+use crate::payloads::*;
+use crate::{MessageType, ProtocolError};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
