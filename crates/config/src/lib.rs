@@ -1,10 +1,12 @@
 pub mod app;
+pub mod auth;
 pub mod cluster;
 pub mod database;
 pub mod redis;
 pub mod server;
 
 pub use app::Config;
+pub use auth::AuthConfig;
 pub use cluster::ClusterConfig;
 pub use database::DatabaseConfig;
 pub use redis::RedisConfig;
@@ -35,6 +37,18 @@ impl Config {
             cluster: ClusterConfig {
                 node_id: env::var("NODE_ID").unwrap_or_else(|_| Uuid::new_v4().to_string()),
                 region: env::var("REGION").unwrap_or_else(|_| "local".into()),
+            },
+
+            auth: AuthConfig {
+                jwt_secret: env::var("JWT_SECRET").expect("JWT_SECRET is missing"),
+                jwt_issuer: env::var("JWT_ISSUER")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                auth_timeout_secs: env::var("AUTH_TIMEOUT_SECS")
+                    .unwrap_or_else(|_| "10".into())
+                    .parse()
+                    .expect("Invalid AUTH_TIMEOUT_SECS"),
             },
         }
     }

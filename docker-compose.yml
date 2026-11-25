@@ -30,9 +30,11 @@ services:
       - redis
       - postgres
     environment:
+      - PORT=${PORT}
       - REDIS_URL=${REDIS_URL}
       - DATABASE_URL=${DATABASE_URL}
       - REGION=${REGION}
+      - JWT_SECRET=${JWT_SECRET}
     ports:
       - "${PORT}"
     develop:
