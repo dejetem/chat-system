@@ -269,6 +269,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cluster",
+ "config",
+ "protocol",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
