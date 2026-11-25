@@ -1,6 +1,9 @@
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
+use auth::{AuthenticatedUser, Authenticator};
 use protocol::{
     AuthFailedPayload, AuthOkPayload, ErrorPayload, Frame, Message, PongPayload, ProtocolError,
 };
@@ -13,6 +16,9 @@ use crate::error::{
 use crate::framed::{FrameReader, FrameWriter};
 
 const OUTBOUND_CHANNEL_CAPACITY: usize = 64;
+
+/// Default deadline for a newly accepted connection to complete authentication.
+pub const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Unique per-node identifier assigned to an accepted client connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -29,8 +35,28 @@ impl fmt::Display for ConnectionId {
 pub enum ConnectionState {
     /// Connection has not yet completed authentication.
     Unauthenticated,
-    /// Connection authenticated under `username`.
-    Authenticated { username: String },
+    /// Connection authenticated as the verified user.
+    Authenticated(AuthenticatedUser),
+}
+
+impl ConnectionState {
+    /// Returns `true` if the connection has completed authentication.
+    pub fn is_authenticated(&self) -> bool {
+        matches!(self, ConnectionState::Authenticated(_))
+    }
+
+    /// Returns the authenticated user identity, if authenticated.
+    pub fn user(&self) -> Option<&AuthenticatedUser> {
+        match self {
+            ConnectionState::Unauthenticated => None,
+            ConnectionState::Authenticated(user) => Some(user),
+        }
+    }
+
+    /// Returns the authenticated username, if authenticated.
+    pub fn username(&self) -> Option<&str> {
+        self.user().map(|user| user.username.as_str())
+    }
 }
 
 /// Clonable handle for pushing outbound frames to a running connection task.
@@ -68,6 +94,8 @@ pub struct Connection<R, W> {
     outbound_rx: mpsc::Receiver<Frame>,
     // Retained internally so `outbound_rx.recv()` suspends even before external registries clone a handle.
     handle: ConnectionHandle,
+    authenticator: Arc<dyn Authenticator>,
+    auth_timeout: Duration,
 }
 
 impl<R, W> Connection<R, W>
@@ -76,7 +104,13 @@ where
     W: AsyncWrite + Unpin,
 {
     /// Creates a new unauthenticated [`Connection`] over split async reader/writer halves.
-    pub fn new(id: ConnectionId, peer_addr: SocketAddr, reader: R, writer: W) -> Self {
+    pub fn new(
+        id: ConnectionId,
+        peer_addr: SocketAddr,
+        reader: R,
+        writer: W,
+        authenticator: Arc<dyn Authenticator>,
+    ) -> Self {
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
         let handle = ConnectionHandle {
             id,
@@ -92,7 +126,15 @@ where
             writer: FrameWriter::new(writer),
             outbound_rx,
             handle,
+            authenticator,
+            auth_timeout: DEFAULT_AUTH_TIMEOUT,
         }
+    }
+
+    /// Overrides the pre-authentication handshake timeout for this connection.
+    pub fn with_auth_timeout(mut self, auth_timeout: Duration) -> Self {
+        self.auth_timeout = auth_timeout;
+        self
     }
 
     /// Returns a clonable [`ConnectionHandle`] for delivering outbound frames.
@@ -116,6 +158,9 @@ where
 
         tracing::info!(connection_id = %self.id, peer = %self.peer_addr, "client connected");
 
+        // Compute the handshake deadline once so pre-auth keepalive pings cannot extend it.
+        let auth_deadline = tokio::time::Instant::now() + self.auth_timeout;
+
         loop {
             tokio::select! {
                 changed_res = shutdown_rx.changed() => {
@@ -131,6 +176,16 @@ where
                         Ok(()) => {}
                         Err(_) => break,
                     }
+                }
+                _ = tokio::time::sleep_until(auth_deadline), if !self.state.is_authenticated() => {
+                    tracing::warn!(
+                        connection_id = %self.id,
+                        peer = %self.peer_addr,
+                        timeout_ms = self.auth_timeout.as_millis(),
+                        "closing unauthenticated connection after auth timeout"
+                    );
+                    let _ = self.send_message(Message::AuthFailed(AuthFailedPayload)).await;
+                    break;
                 }
                 Some(frame) = self.outbound_rx.recv() => {
                     self.writer.write_frame(&frame).await?;
@@ -204,49 +259,52 @@ where
                 Ok(true)
             }
             Message::Auth(payload) => {
-                if matches!(self.state, ConnectionState::Authenticated { .. }) {
+                if self.state.is_authenticated() {
                     self.send_error(ERR_BAD_REQUEST, "already authenticated")
                         .await?;
                     return Ok(true);
                 }
 
-                // TODO(Phase 3): Replace with auth crate JWT validation.
-                if payload.username.trim().is_empty() || payload.token.trim().is_empty() {
-                    tracing::warn!(
-                        connection_id = %self.id,
-                        peer = %self.peer_addr,
-                        "authentication failed: empty username or token"
-                    );
-                    self.send_message(Message::AuthFailed(AuthFailedPayload))
-                        .await?;
-                    return Ok(false);
+                match self
+                    .authenticator
+                    .authenticate(&payload.username, &payload.token)
+                {
+                    Ok(user) => {
+                        tracing::info!(
+                            connection_id = %self.id,
+                            peer = %self.peer_addr,
+                            username = %user.username,
+                            role = %user.role,
+                            "client authenticated"
+                        );
+                        self.state = ConnectionState::Authenticated(user);
+                        self.send_message(Message::AuthOk(AuthOkPayload)).await?;
+                        Ok(true)
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            connection_id = %self.id,
+                            peer = %self.peer_addr,
+                            username = %payload.username,
+                            error = %err,
+                            "authentication failed"
+                        );
+                        self.send_message(Message::AuthFailed(AuthFailedPayload))
+                            .await?;
+                        Ok(false)
+                    }
                 }
-
-                self.state = ConnectionState::Authenticated {
-                    username: payload.username.clone(),
-                };
-                tracing::info!(
-                    connection_id = %self.id,
-                    peer = %self.peer_addr,
-                    username = %payload.username,
-                    "client authenticated"
-                );
-                self.send_message(Message::AuthOk(AuthOkPayload)).await?;
-                Ok(true)
             }
             Message::JoinRoom(_)
             | Message::LeaveRoom(_)
             | Message::RoomMessage(_)
             | Message::PrivateMessage(_) => {
-                match &self.state {
-                    ConnectionState::Unauthenticated => {
-                        self.send_error(ERR_UNAUTHORIZED, "authentication required")
-                            .await?;
-                    }
-                    ConnectionState::Authenticated { .. } => {
-                        self.send_error(ERR_NOT_IMPLEMENTED, "feature not yet implemented")
-                            .await?;
-                    }
+                if self.state.is_authenticated() {
+                    self.send_error(ERR_NOT_IMPLEMENTED, "feature not yet implemented")
+                        .await?;
+                } else {
+                    self.send_error(ERR_UNAUTHORIZED, "authentication required")
+                        .await?;
                 }
                 Ok(true)
             }
@@ -262,7 +320,10 @@ where
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use auth::{Authenticator, Claims, JwtAuthenticator, Role};
     use protocol::{
         AuthFailedPayload, AuthOkPayload, AuthPayload, ErrorPayload, Frame, JoinRoomPayload, MAGIC,
         Message, MessageType, PingPayload, PongPayload, PrivateMessagePayload, ProtocolError,
@@ -271,7 +332,7 @@ mod tests {
     use tokio::io::{AsyncWriteExt, duplex};
     use tokio::sync::watch;
 
-    use super::{Connection, ConnectionId, ConnectionState};
+    use super::{Connection, ConnectionId, ConnectionState, DEFAULT_AUTH_TIMEOUT};
     use crate::error::{
         ConnectionError, ERR_BAD_REQUEST, ERR_NOT_IMPLEMENTED, ERR_PROTOCOL_ERROR, ERR_UNAUTHORIZED,
     };
@@ -281,20 +342,44 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000)
     }
 
+    fn test_authenticator() -> Arc<JwtAuthenticator> {
+        Arc::new(JwtAuthenticator::from_secret("test-secret").unwrap())
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
     struct TestConnection {
         writer: FrameWriter<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
         reader: FrameReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
         handle: super::ConnectionHandle,
+        auth: Arc<JwtAuthenticator>,
         shutdown_tx: watch::Sender<bool>,
         join: tokio::task::JoinHandle<Result<ConnectionState, ConnectionError>>,
     }
 
     fn spawn_connection() -> TestConnection {
+        spawn_connection_with_timeout(DEFAULT_AUTH_TIMEOUT)
+    }
+
+    fn spawn_connection_with_timeout(auth_timeout: Duration) -> TestConnection {
         let (client_stream, server_stream) = duplex(4096);
         let (client_read, client_write) = tokio::io::split(client_stream);
         let (server_read, server_write) = tokio::io::split(server_stream);
 
-        let mut conn = Connection::new(ConnectionId(1), test_addr(), server_read, server_write);
+        let auth = test_authenticator();
+        let mut conn = Connection::new(
+            ConnectionId(1),
+            test_addr(),
+            server_read,
+            server_write,
+            Arc::clone(&auth) as Arc<dyn Authenticator>,
+        )
+        .with_auth_timeout(auth_timeout);
         let handle = conn.handle();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -307,6 +392,7 @@ mod tests {
             writer: FrameWriter::new(client_write),
             reader: FrameReader::new(client_read),
             handle,
+            auth,
             shutdown_tx,
             join,
         }
@@ -318,6 +404,7 @@ mod tests {
             mut writer,
             mut reader,
             handle: _handle,
+            auth,
             shutdown_tx: _shutdown_tx,
             join,
         } = spawn_connection();
@@ -331,10 +418,13 @@ mod tests {
             Message::Pong(PongPayload)
         );
 
+        let token = auth
+            .issue_token("alice", Role::Moderator, Duration::from_secs(60))
+            .unwrap();
         writer
             .write_frame(&Frame::new(Message::Auth(AuthPayload {
                 username: "alice".to_string(),
-                token: "valid-token".to_string(),
+                token,
             })))
             .await
             .unwrap();
@@ -355,12 +445,8 @@ mod tests {
         drop(writer);
         drop(reader);
         let final_state = join.await.unwrap().unwrap();
-        assert_eq!(
-            final_state,
-            ConnectionState::Authenticated {
-                username: "alice".to_string()
-            }
-        );
+        assert_eq!(final_state.username(), Some("alice"));
+        assert_eq!(final_state.user().unwrap().role, Role::Moderator);
     }
 
     #[tokio::test]
@@ -369,6 +455,7 @@ mod tests {
             mut writer,
             mut reader,
             handle: _handle,
+            auth: _auth,
             shutdown_tx: _shutdown_tx,
             join,
         } = spawn_connection();
@@ -407,14 +494,18 @@ mod tests {
             mut writer,
             mut reader,
             handle: _handle,
+            auth,
             shutdown_tx: _shutdown_tx,
             join,
         } = spawn_connection();
 
+        let token = auth
+            .issue_token("alice", Role::User, Duration::from_secs(60))
+            .unwrap();
         writer
             .write_frame(&Frame::new(Message::Auth(AuthPayload {
                 username: "alice".to_string(),
-                token: "tok".to_string(),
+                token: token.clone(),
             })))
             .await
             .unwrap();
@@ -426,7 +517,7 @@ mod tests {
         writer
             .write_frame(&Frame::new(Message::Auth(AuthPayload {
                 username: "alice".to_string(),
-                token: "tok".to_string(),
+                token,
             })))
             .await
             .unwrap();
@@ -459,19 +550,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_credentials_send_auth_failed_and_close_connection() {
+    async fn invalid_signature_jwt_sends_auth_failed_and_closes_connection() {
         let TestConnection {
             mut writer,
             mut reader,
             handle: _handle,
+            auth: _auth,
             shutdown_tx: _shutdown_tx,
             join,
         } = spawn_connection();
 
+        let wrong_issuer = JwtAuthenticator::from_secret("wrong-secret").unwrap();
+        let bad_token = wrong_issuer
+            .issue_token("alice", Role::User, Duration::from_secs(60))
+            .unwrap();
+
         writer
             .write_frame(&Frame::new(Message::Auth(AuthPayload {
-                username: "   ".to_string(),
-                token: "valid-token".to_string(),
+                username: "alice".to_string(),
+                token: bad_token,
             })))
             .await
             .unwrap();
@@ -487,11 +584,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_jwt_sends_auth_failed_and_closes_connection() {
+        let TestConnection {
+            mut writer,
+            mut reader,
+            handle: _handle,
+            auth,
+            shutdown_tx: _shutdown_tx,
+            join,
+        } = spawn_connection();
+
+        let expired_token = auth
+            .encode_claims(&Claims {
+                sub: "alice".to_string(),
+                exp: now_secs().saturating_sub(1),
+                iat: None,
+                iss: None,
+                role: Role::User,
+            })
+            .unwrap();
+
+        writer
+            .write_frame(&Frame::new(Message::Auth(AuthPayload {
+                username: "alice".to_string(),
+                token: expired_token,
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reader.read_frame().await.unwrap().unwrap().message,
+            Message::AuthFailed(AuthFailedPayload)
+        );
+        assert_eq!(reader.read_frame().await.unwrap(), None);
+
+        let final_state = join.await.unwrap().unwrap();
+        assert_eq!(final_state, ConnectionState::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn subject_mismatch_sends_auth_failed_and_closes_connection() {
+        let TestConnection {
+            mut writer,
+            mut reader,
+            handle: _handle,
+            auth,
+            shutdown_tx: _shutdown_tx,
+            join,
+        } = spawn_connection();
+
+        let alice_token = auth
+            .issue_token("alice", Role::Admin, Duration::from_secs(60))
+            .unwrap();
+
+        writer
+            .write_frame(&Frame::new(Message::Auth(AuthPayload {
+                username: "bob".to_string(),
+                token: alice_token,
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reader.read_frame().await.unwrap().unwrap().message,
+            Message::AuthFailed(AuthFailedPayload)
+        );
+        assert_eq!(reader.read_frame().await.unwrap(), None);
+
+        let final_state = join.await.unwrap().unwrap();
+        assert_eq!(final_state, ConnectionState::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_timeout_closes_idle_client_but_authenticated_client_stays_open() {
+        // 1. Unauthenticated client exceeds timeout and is disconnected.
+        let TestConnection {
+            writer: _idle_writer,
+            reader: mut idle_reader,
+            handle: _idle_handle,
+            auth: _idle_auth,
+            shutdown_tx: _idle_shutdown,
+            join: idle_join,
+        } = spawn_connection_with_timeout(Duration::from_millis(40));
+
+        assert_eq!(
+            idle_reader.read_frame().await.unwrap().unwrap().message,
+            Message::AuthFailed(AuthFailedPayload)
+        );
+        assert_eq!(idle_reader.read_frame().await.unwrap(), None);
+        assert_eq!(
+            idle_join.await.unwrap().unwrap(),
+            ConnectionState::Unauthenticated
+        );
+
+        // 2. Authenticated client remains connected past the 40ms auth timeout.
+        let TestConnection {
+            mut writer,
+            mut reader,
+            handle: _handle,
+            auth,
+            shutdown_tx: _shutdown_tx,
+            join,
+        } = spawn_connection_with_timeout(Duration::from_millis(40));
+
+        let token = auth
+            .issue_token("alice", Role::User, Duration::from_secs(60))
+            .unwrap();
+        writer
+            .write_frame(&Frame::new(Message::Auth(AuthPayload {
+                username: "alice".to_string(),
+                token,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.read_frame().await.unwrap().unwrap().message,
+            Message::AuthOk(AuthOkPayload)
+        );
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        writer
+            .write_frame(&Frame::new(Message::Ping(PingPayload)))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.read_frame().await.unwrap().unwrap().message,
+            Message::Pong(PongPayload)
+        );
+
+        drop(writer);
+        drop(reader);
+        assert_eq!(join.await.unwrap().unwrap().username(), Some("alice"));
+    }
+
+    #[tokio::test]
     async fn handle_push_delivers_frame_to_client() {
         let TestConnection {
             writer,
             mut reader,
             handle,
+            auth: _auth,
             shutdown_tx: _shutdown_tx,
             join,
         } = spawn_connection();
@@ -515,7 +747,13 @@ mod tests {
         let (client_read, mut client_write) = tokio::io::split(client_stream);
         let (server_read, server_write) = tokio::io::split(server_stream);
 
-        let mut conn = Connection::new(ConnectionId(2), test_addr(), server_read, server_write);
+        let mut conn = Connection::new(
+            ConnectionId(2),
+            test_addr(),
+            server_read,
+            server_write,
+            test_authenticator(),
+        );
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let join = tokio::spawn(async move { conn.run(shutdown_rx).await });
 
@@ -547,6 +785,7 @@ mod tests {
             writer: _writer,
             mut reader,
             handle: _handle,
+            auth: _auth,
             shutdown_tx,
             join,
         } = spawn_connection();

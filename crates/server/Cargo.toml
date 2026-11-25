@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+auth = { path = "../auth" }
 cluster = { path = "../cluster" }
 config = { path = "../config" }
 protocol = { path = "../protocol" }

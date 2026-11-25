@@ -4,13 +4,14 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
+use auth::Authenticator;
 use cluster::NodeInfo;
 use config::ServerConfig;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-use crate::connection::{Connection, ConnectionId};
+use crate::connection::{Connection, ConnectionId, DEFAULT_AUTH_TIMEOUT};
 
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,17 +35,31 @@ impl Drop for ActiveConnectionGuard {
 pub struct Server {
     config: ServerConfig,
     node: NodeInfo,
+    authenticator: Arc<dyn Authenticator>,
+    auth_timeout: Duration,
     active_connections: Arc<AtomicUsize>,
 }
 
 impl Server {
-    /// Creates a new [`Server`] bound to `config` and identified by `node`.
-    pub fn new(config: ServerConfig, node: NodeInfo) -> Self {
+    /// Creates a new [`Server`] bound to `config`, identified by `node`, and enforcing `authenticator`.
+    pub fn new(
+        config: ServerConfig,
+        node: NodeInfo,
+        authenticator: Arc<dyn Authenticator>,
+    ) -> Self {
         Self {
             config,
             node,
+            authenticator,
+            auth_timeout: DEFAULT_AUTH_TIMEOUT,
             active_connections: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Overrides the pre-authentication handshake timeout applied to accepted connections.
+    pub fn with_auth_timeout(mut self, auth_timeout: Duration) -> Self {
+        self.auth_timeout = auth_timeout;
+        self
     }
 
     /// Returns the number of currently active client connections.
@@ -117,10 +132,19 @@ impl Server {
                             let conn_id = ConnectionId(next_conn_id.fetch_add(1, Ordering::Relaxed));
                             let conn_shutdown = shutdown_tx.subscribe();
                             let guard = ActiveConnectionGuard::new(Arc::clone(&self.active_connections));
+                            let authenticator = Arc::clone(&self.authenticator);
+                            let auth_timeout = self.auth_timeout;
 
                             tasks.spawn(async move {
                                 let _guard = guard;
-                                let mut conn = Connection::new(conn_id, peer_addr, reader, writer);
+                                let mut conn = Connection::new(
+                                    conn_id,
+                                    peer_addr,
+                                    reader,
+                                    writer,
+                                    authenticator,
+                                )
+                                .with_auth_timeout(auth_timeout);
                                 if let Err(err) = conn.run(conn_shutdown).await {
                                     tracing::debug!(
                                         connection_id = %conn_id,
