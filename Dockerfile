@@ -1,10 +1,10 @@
 # ---------- Builder ----------
-FROM rust:1.85 as builder
+FROM rust:1-bookworm AS builder
 
 WORKDIR /app
 
 # Copy workspace files
-COPY Cargo.toml .
+COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY apps ./apps
 
