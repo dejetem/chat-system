@@ -14,27 +14,65 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
 
       - name: Install Dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
 
-      - name: Check
-        run: cargo check --workspace
-
       - name: Format
         run: cargo fmt --all -- --check
 
-      - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+      - name: Check workspace
+        run: cargo check --workspace --all-targets
 
-      - name: Test
-        run: cargo test --workspace
+      - name: Clippy protocol
+        run: cargo clippy -p protocol --all-targets -- -D warnings
 
-      # - name: Run protocol tests
-      #   run: cargo test -p protocol
+      - name: Clippy config
+        run: cargo clippy -p config --all-targets -- -D warnings
 
-      # - name: Run clippy
-      #   run: cargo clippy -p protocol -- -D warnings
+      - name: Clippy cluster
+        run: cargo clippy -p cluster --all-targets -- -D warnings
 
-      # - name: Check formatting
-      #   run: cargo fmt --all -- --check
+      - name: Clippy auth
+        run: cargo clippy -p auth --all-targets -- -D warnings
+
+      - name: Clippy pubsub
+        run: cargo clippy -p pubsub --all-targets -- -D warnings
+
+      - name: Clippy storage
+        run: cargo clippy -p storage --all-targets -- -D warnings
+
+      - name: Clippy server
+        run: cargo clippy -p server --all-targets -- -D warnings
+
+      - name: Clippy chat-node
+        run: cargo clippy -p chat-node --all-targets -- -D warnings
+
+      - name: Test protocol
+        run: cargo test -p protocol
+
+      - name: Test config
+        run: cargo test -p config
+
+      - name: Test cluster
+        run: cargo test -p cluster
+
+      - name: Test auth
+        run: cargo test -p auth
+
+      - name: Test pubsub
+        run: cargo test -p pubsub
+
+      - name: Test storage
+        run: cargo test -p storage
+
+      - name: Test server
+        run: cargo test -p server
+
+      - name: Test chat-node
+        run: cargo test -p chat-node

@@ -3,7 +3,8 @@ resolver = "3"
 members = [
     "apps/chat-node",
     "crates/auth", 
-    "crates/cluster", "crates/config", 
+    "crates/cluster", 
+    "crates/config", 
     "crates/protocol", 
     "crates/pubsub", 
     "crates/server", 
