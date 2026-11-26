@@ -22,3 +22,8 @@ Cargo.lock  # For libraries, commit for binaries
 
 # pdf
 *.pdf
+docs/phase.md
+docs/b.md
+docs/pv.md
+docs/t.md
+docs/th.md

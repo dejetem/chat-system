@@ -23,5 +23,5 @@ pub use header::Header;
 pub use io::*;
 pub use message::Message;
 pub use message_type::MessageType;
-pub use payloads::PingPayload;
+pub use payloads::*;
 pub use version::Version;
