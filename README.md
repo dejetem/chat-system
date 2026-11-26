@@ -1,11 +1,13 @@
 ## Run Multiple Chat Nodes
 ```bash
+docker compose up --build --scale chat-node=3
 docker compose up --scale chat-node=3
 ```
 
 ## Run in Watch Mode (Auto-reloading)
 To automatically rebuild and reload containers when source files change:
 ```bash
+docker compose up --build --watch --scale chat-node=3
 docker compose up --watch --scale chat-node=3
 ```
 
