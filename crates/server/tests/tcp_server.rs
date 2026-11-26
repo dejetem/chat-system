@@ -7,10 +7,11 @@ use auth::{Claims, JwtAuthenticator, Role};
 use cluster::NodeInfo;
 use config::ServerConfig;
 use protocol::{
-    AuthFailedPayload, AuthOkPayload, AuthPayload, Frame, HEADER_SIZE, JoinRoomPayload, MAGIC,
-    Message, MessageType, PingPayload, PongPayload, Version,
+    AckPayload, AuthFailedPayload, AuthOkPayload, AuthPayload, Frame, HEADER_SIZE, JoinRoomPayload,
+    LeaveRoomPayload, MAGIC, Message, MessageType, PingPayload, PongPayload, RoomMessagePayload,
+    Version,
 };
-use server::{ERR_PROTOCOL_ERROR, ERR_UNAUTHORIZED, FrameReader, FrameWriter, Server};
+use server::{ERR_PROTOCOL_ERROR, ERR_UNAUTHORIZED, FrameReader, FrameWriter, RoomManager, Server};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
@@ -18,6 +19,7 @@ use tokio::sync::oneshot;
 struct TestServer {
     addr: SocketAddr,
     auth: Arc<JwtAuthenticator>,
+    room_manager: RoomManager,
     active_connections: Arc<AtomicUsize>,
     shutdown_tx: oneshot::Sender<()>,
     server_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -37,6 +39,7 @@ async fn spawn_test_server() -> TestServer {
     );
     let listener = server.bind().await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let room_manager = server.room_manager().clone();
     let active_connections = server.active_connections_counter();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -51,6 +54,7 @@ async fn spawn_test_server() -> TestServer {
     TestServer {
         addr,
         auth,
+        room_manager,
         active_connections,
         shutdown_tx,
         server_handle,
@@ -74,11 +78,43 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+async fn connect_authenticated_client(
+    addr: SocketAddr,
+    auth: &JwtAuthenticator,
+    username: &str,
+) -> (
+    FrameReader<tokio::net::tcp::OwnedReadHalf>,
+    FrameWriter<tokio::net::tcp::OwnedWriteHalf>,
+) {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, write_half) = stream.into_split();
+    let mut reader = FrameReader::new(read_half);
+    let mut writer = FrameWriter::new(write_half);
+
+    let token = auth
+        .issue_token(username, Role::User, Duration::from_secs(60))
+        .unwrap();
+    writer
+        .write_frame(&Frame::new(Message::Auth(AuthPayload {
+            username: username.to_string(),
+            token,
+        })))
+        .await
+        .unwrap();
+    assert_eq!(
+        reader.read_frame().await.unwrap().unwrap().message,
+        Message::AuthOk(AuthOkPayload)
+    );
+
+    (reader, writer)
+}
+
 #[tokio::test]
 async fn tcp_ping_pong_and_auth_lifecycle() {
     let TestServer {
         addr,
         auth,
+        room_manager: _room_manager,
         active_connections,
         shutdown_tx,
         server_handle,
@@ -147,6 +183,7 @@ async fn tcp_multiple_concurrent_clients() {
     let TestServer {
         addr,
         auth,
+        room_manager: _room_manager,
         active_connections,
         shutdown_tx,
         server_handle,
@@ -156,23 +193,9 @@ async fn tcp_multiple_concurrent_clients() {
     for idx in 0..10usize {
         let auth = Arc::clone(&auth);
         clients.push(tokio::spawn(async move {
-            let stream = TcpStream::connect(addr).await.unwrap();
-            let (read_half, write_half) = stream.into_split();
-            let mut reader = FrameReader::new(read_half);
-            let mut writer = FrameWriter::new(write_half);
-
             let username = format!("user-{idx}");
-            let token = auth
-                .issue_token(&username, Role::User, Duration::from_secs(60))
-                .unwrap();
-            writer
-                .write_frame(&Frame::new(Message::Auth(AuthPayload { username, token })))
-                .await
-                .unwrap();
-            assert_eq!(
-                reader.read_frame().await.unwrap().unwrap().message,
-                Message::AuthOk(AuthOkPayload)
-            );
+            let (mut reader, mut writer) =
+                connect_authenticated_client(addr, &auth, &username).await;
 
             for _ in 0..3 {
                 writer
@@ -202,6 +225,7 @@ async fn tcp_malformed_client_isolated_from_healthy_clients() {
     let TestServer {
         addr,
         auth: _auth,
+        room_manager: _room_manager,
         active_connections,
         shutdown_tx,
         server_handle,
@@ -253,6 +277,7 @@ async fn tcp_invalid_and_expired_jwt_rejected_and_dropped() {
     let TestServer {
         addr,
         auth,
+        room_manager: _room_manager,
         active_connections,
         shutdown_tx,
         server_handle,
@@ -361,6 +386,195 @@ async fn tcp_invalid_and_expired_jwt_rejected_and_dropped() {
             Message::Pong(PongPayload)
         );
     }
+
+    wait_for_zero_connections(&active_connections).await;
+
+    shutdown_tx.send(()).unwrap();
+    server_handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn tcp_room_broadcast_multi_room_isolation_and_leave() {
+    let TestServer {
+        addr,
+        auth,
+        room_manager: _room_manager,
+        active_connections,
+        shutdown_tx,
+        server_handle,
+    } = spawn_test_server().await;
+
+    let (mut alice_reader, mut alice_writer) =
+        connect_authenticated_client(addr, &auth, "alice").await;
+    let (mut bob_reader, mut bob_writer) = connect_authenticated_client(addr, &auth, "bob").await;
+    let (mut carol_reader, mut carol_writer) =
+        connect_authenticated_client(addr, &auth, "carol").await;
+
+    // Alice joins room 1; Bob joins rooms 1 and 2; Carol joins room 2.
+    alice_writer
+        .write_frame(&Frame::new(Message::JoinRoom(JoinRoomPayload {
+            room_id: 1,
+        })))
+        .await
+        .unwrap();
+    assert_eq!(
+        alice_reader.read_frame().await.unwrap().unwrap().message,
+        Message::Ack(AckPayload { message_id: 1 })
+    );
+
+    for room_id in [1u64, 2u64] {
+        bob_writer
+            .write_frame(&Frame::new(Message::JoinRoom(JoinRoomPayload { room_id })))
+            .await
+            .unwrap();
+        assert_eq!(
+            bob_reader.read_frame().await.unwrap().unwrap().message,
+            Message::Ack(AckPayload {
+                message_id: room_id
+            })
+        );
+    }
+
+    carol_writer
+        .write_frame(&Frame::new(Message::JoinRoom(JoinRoomPayload {
+            room_id: 2,
+        })))
+        .await
+        .unwrap();
+    assert_eq!(
+        carol_reader.read_frame().await.unwrap().unwrap().message,
+        Message::Ack(AckPayload { message_id: 2 })
+    );
+
+    // Alice broadcasts to room 1 -> Bob receives it; Carol does not.
+    let room1_msg = RoomMessagePayload {
+        room_id: 1,
+        message: "room 1 hello".to_string(),
+    };
+    alice_writer
+        .write_frame(&Frame::new(Message::RoomMessage(room1_msg.clone())))
+        .await
+        .unwrap();
+    match alice_reader.read_frame().await.unwrap().unwrap().message {
+        Message::Ack(ack) => assert!(ack.message_id >= 1),
+        other => panic!("expected Ack, got {other:?}"),
+    }
+    assert_eq!(
+        bob_reader.read_frame().await.unwrap().unwrap().message,
+        Message::RoomMessage(room1_msg)
+    );
+
+    // Carol broadcasts to room 2 -> Bob receives it; verify Carol received no room 1 leak first.
+    let room2_msg = RoomMessagePayload {
+        room_id: 2,
+        message: "room 2 hello".to_string(),
+    };
+    carol_writer
+        .write_frame(&Frame::new(Message::RoomMessage(room2_msg.clone())))
+        .await
+        .unwrap();
+    match carol_reader.read_frame().await.unwrap().unwrap().message {
+        Message::Ack(ack) => assert!(ack.message_id >= 1),
+        other => panic!("expected Ack, got {other:?}"),
+    }
+    assert_eq!(
+        bob_reader.read_frame().await.unwrap().unwrap().message,
+        Message::RoomMessage(room2_msg)
+    );
+
+    // Bob leaves room 1.
+    bob_writer
+        .write_frame(&Frame::new(Message::LeaveRoom(LeaveRoomPayload {
+            room_id: 1,
+        })))
+        .await
+        .unwrap();
+    assert_eq!(
+        bob_reader.read_frame().await.unwrap().unwrap().message,
+        Message::Ack(AckPayload { message_id: 1 })
+    );
+
+    // Alice sends another message to room 1 -> Bob should not receive it.
+    alice_writer
+        .write_frame(&Frame::new(Message::RoomMessage(RoomMessagePayload {
+            room_id: 1,
+            message: "after bob left".to_string(),
+        })))
+        .await
+        .unwrap();
+    match alice_reader.read_frame().await.unwrap().unwrap().message {
+        Message::Ack(ack) => assert!(ack.message_id >= 1),
+        other => panic!("expected Ack, got {other:?}"),
+    }
+
+    bob_writer
+        .write_frame(&Frame::new(Message::Ping(PingPayload)))
+        .await
+        .unwrap();
+    assert_eq!(
+        bob_reader.read_frame().await.unwrap().unwrap().message,
+        Message::Pong(PongPayload)
+    );
+
+    drop((
+        alice_writer,
+        alice_reader,
+        bob_writer,
+        bob_reader,
+        carol_writer,
+        carol_reader,
+    ));
+    wait_for_zero_connections(&active_connections).await;
+
+    shutdown_tx.send(()).unwrap();
+    server_handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn tcp_disconnect_cleans_up_room_subscriptions() {
+    let TestServer {
+        addr,
+        auth,
+        room_manager,
+        active_connections,
+        shutdown_tx,
+        server_handle,
+    } = spawn_test_server().await;
+
+    let (mut r1, mut w1) = connect_authenticated_client(addr, &auth, "alice").await;
+    let (mut r2, mut w2) = connect_authenticated_client(addr, &auth, "bob").await;
+
+    for (r, w) in [(&mut r1, &mut w1), (&mut r2, &mut w2)] {
+        w.write_frame(&Frame::new(Message::JoinRoom(JoinRoomPayload {
+            room_id: 77,
+        })))
+        .await
+        .unwrap();
+        assert_eq!(
+            r.read_frame().await.unwrap().unwrap().message,
+            Message::Ack(AckPayload { message_id: 77 })
+        );
+    }
+    assert_eq!(room_manager.subscriber_count(77), 2);
+    assert_eq!(room_manager.room_count(), 1);
+
+    drop((w1, r1));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while room_manager.subscriber_count(77) != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for first client's room cleanup");
+
+    drop((w2, r2));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while room_manager.room_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for second client's room cleanup");
 
     wait_for_zero_connections(&active_connections).await;
 
