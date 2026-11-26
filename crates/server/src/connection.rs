@@ -5,17 +5,21 @@ use std::time::Duration;
 
 use auth::{AuthenticatedUser, Authenticator};
 use protocol::{
-    AuthFailedPayload, AuthOkPayload, ErrorPayload, Frame, Message, PongPayload, ProtocolError,
+    AckPayload, AuthFailedPayload, AuthOkPayload, ErrorPayload, Frame, Message, PongPayload,
+    ProtocolError,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::{mpsc, watch};
 
 use crate::error::{
-    ConnectionError, ERR_BAD_REQUEST, ERR_NOT_IMPLEMENTED, ERR_PROTOCOL_ERROR, ERR_UNAUTHORIZED,
+    ConnectionError, ERR_BAD_REQUEST, ERR_FORBIDDEN, ERR_NOT_IMPLEMENTED, ERR_PROTOCOL_ERROR,
+    ERR_UNAUTHORIZED,
 };
 use crate::framed::{FrameReader, FrameWriter};
+use crate::room::RoomManager;
 
-const OUTBOUND_CHANNEL_CAPACITY: usize = 64;
+const OUTBOUND_CHANNEL_CAPACITY: usize = 256;
 
 /// Default deadline for a newly accepted connection to complete authentication.
 pub const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -68,6 +72,21 @@ pub struct ConnectionHandle {
 }
 
 impl ConnectionHandle {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        id: ConnectionId,
+        peer_addr: SocketAddr,
+        capacity: usize,
+    ) -> (Self, mpsc::Receiver<Frame>) {
+        let (outbound_tx, outbound_rx) = mpsc::channel(capacity);
+        let handle = Self {
+            id,
+            peer_addr,
+            outbound_tx,
+        };
+        (handle, outbound_rx)
+    }
+
     /// Returns the connection identifier.
     pub fn id(&self) -> ConnectionId {
         self.id
@@ -78,8 +97,18 @@ impl ConnectionHandle {
         self.peer_addr
     }
 
+    /// Attempts to enqueue `frame` without waiting for queue capacity.
+    pub fn try_send(&self, frame: Frame) -> Result<(), TrySendError<Frame>> {
+        self.outbound_tx.try_send(frame)
+    }
+
+    /// Returns `true` if the owning connection's outbound receiver has been closed.
+    pub fn is_closed(&self) -> bool {
+        self.outbound_tx.is_closed()
+    }
+
     /// Enqueues an outbound [`Frame`] to be written to the connection stream.
-    pub async fn send(&self, frame: Frame) -> Result<(), mpsc::error::SendError<Frame>> {
+    pub async fn send(&self, frame: Frame) -> Result<(), SendError<Frame>> {
         self.outbound_tx.send(frame).await
     }
 }
@@ -95,7 +124,14 @@ pub struct Connection<R, W> {
     // Retained internally so `outbound_rx.recv()` suspends even before external registries clone a handle.
     handle: ConnectionHandle,
     authenticator: Arc<dyn Authenticator>,
+    room_manager: RoomManager,
     auth_timeout: Duration,
+}
+
+impl<R, W> Drop for Connection<R, W> {
+    fn drop(&mut self) {
+        self.room_manager.remove_connection(self.id);
+    }
 }
 
 impl<R, W> Connection<R, W>
@@ -110,6 +146,7 @@ where
         reader: R,
         writer: W,
         authenticator: Arc<dyn Authenticator>,
+        room_manager: RoomManager,
     ) -> Self {
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
         let handle = ConnectionHandle {
@@ -127,6 +164,7 @@ where
             outbound_rx,
             handle,
             authenticator,
+            room_manager,
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
         }
     }
@@ -148,7 +186,21 @@ where
     }
 
     /// Runs the connection event loop until the peer disconnects, errors, or shutdown is signaled.
-    pub async fn run(
+    pub async fn run(&mut self, shutdown_rx: watch::Receiver<bool>) -> Result<(), ConnectionError> {
+        let result = self.run_loop(shutdown_rx).await;
+        let cleaned = self.room_manager.remove_connection(self.id);
+        if cleaned > 0 {
+            tracing::debug!(
+                connection_id = %self.id,
+                peer = %self.peer_addr,
+                rooms_cleaned = cleaned,
+                "cleaned up room subscriptions on disconnect"
+            );
+        }
+        result
+    }
+
+    async fn run_loop(
         &mut self,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> Result<(), ConnectionError> {
@@ -295,10 +347,85 @@ where
                     }
                 }
             }
-            Message::JoinRoom(_)
-            | Message::LeaveRoom(_)
-            | Message::RoomMessage(_)
-            | Message::PrivateMessage(_) => {
+            Message::JoinRoom(payload) => {
+                if !self.state.is_authenticated() {
+                    self.send_error(ERR_UNAUTHORIZED, "authentication required")
+                        .await?;
+                    return Ok(true);
+                }
+
+                self.room_manager.join_room(payload.room_id, self.handle());
+                tracing::debug!(
+                    connection_id = %self.id,
+                    room_id = payload.room_id,
+                    "joined room"
+                );
+                self.send_message(Message::Ack(AckPayload {
+                    message_id: payload.room_id,
+                }))
+                .await?;
+                Ok(true)
+            }
+            Message::LeaveRoom(payload) => {
+                if !self.state.is_authenticated() {
+                    self.send_error(ERR_UNAUTHORIZED, "authentication required")
+                        .await?;
+                    return Ok(true);
+                }
+
+                if !self.room_manager.leave_room(payload.room_id, self.id) {
+                    self.send_error(
+                        ERR_BAD_REQUEST,
+                        format!("not subscribed to room {}", payload.room_id),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+
+                tracing::debug!(
+                    connection_id = %self.id,
+                    room_id = payload.room_id,
+                    "left room"
+                );
+                self.send_message(Message::Ack(AckPayload {
+                    message_id: payload.room_id,
+                }))
+                .await?;
+                Ok(true)
+            }
+            Message::RoomMessage(payload) => {
+                if !self.state.is_authenticated() {
+                    self.send_error(ERR_UNAUTHORIZED, "authentication required")
+                        .await?;
+                    return Ok(true);
+                }
+
+                if payload.message.is_empty() {
+                    self.send_error(ERR_BAD_REQUEST, "room message cannot be empty")
+                        .await?;
+                    return Ok(true);
+                }
+
+                if !self.room_manager.is_subscribed(payload.room_id, self.id) {
+                    self.send_error(
+                        ERR_FORBIDDEN,
+                        format!("not subscribed to room {}", payload.room_id),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+
+                let room_id = payload.room_id;
+                let message_id = self.room_manager.next_message_id();
+                let broadcast_frame = Frame::new(Message::RoomMessage(payload));
+                self.room_manager
+                    .broadcast(room_id, broadcast_frame, Some(self.id))
+                    .await;
+                self.send_message(Message::Ack(AckPayload { message_id }))
+                    .await?;
+                Ok(true)
+            }
+            Message::PrivateMessage(_) => {
                 if self.state.is_authenticated() {
                     self.send_error(ERR_NOT_IMPLEMENTED, "feature not yet implemented")
                         .await?;
@@ -325,18 +452,20 @@ mod tests {
 
     use auth::{Authenticator, Claims, JwtAuthenticator, Role};
     use protocol::{
-        AuthFailedPayload, AuthOkPayload, AuthPayload, ErrorPayload, Frame, JoinRoomPayload, MAGIC,
-        Message, MessageType, PingPayload, PongPayload, PrivateMessagePayload, ProtocolError,
-        RoomMessagePayload, Version,
+        AckPayload, AuthFailedPayload, AuthOkPayload, AuthPayload, ErrorPayload, Frame,
+        JoinRoomPayload, LeaveRoomPayload, MAGIC, Message, MessageType, PingPayload, PongPayload,
+        PrivateMessagePayload, ProtocolError, RoomMessagePayload, Version,
     };
     use tokio::io::{AsyncWriteExt, duplex};
     use tokio::sync::watch;
 
     use super::{Connection, ConnectionId, ConnectionState, DEFAULT_AUTH_TIMEOUT};
     use crate::error::{
-        ConnectionError, ERR_BAD_REQUEST, ERR_NOT_IMPLEMENTED, ERR_PROTOCOL_ERROR, ERR_UNAUTHORIZED,
+        ConnectionError, ERR_BAD_REQUEST, ERR_FORBIDDEN, ERR_NOT_IMPLEMENTED, ERR_PROTOCOL_ERROR,
+        ERR_UNAUTHORIZED,
     };
     use crate::framed::{FrameReader, FrameWriter};
+    use crate::room::RoomManager;
 
     fn test_addr() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000)
@@ -363,21 +492,40 @@ mod tests {
     }
 
     fn spawn_connection() -> TestConnection {
-        spawn_connection_with_timeout(DEFAULT_AUTH_TIMEOUT)
+        spawn_connection_with(
+            ConnectionId(1),
+            RoomManager::new(),
+            test_authenticator(),
+            DEFAULT_AUTH_TIMEOUT,
+        )
     }
 
     fn spawn_connection_with_timeout(auth_timeout: Duration) -> TestConnection {
+        spawn_connection_with(
+            ConnectionId(1),
+            RoomManager::new(),
+            test_authenticator(),
+            auth_timeout,
+        )
+    }
+
+    fn spawn_connection_with(
+        id: ConnectionId,
+        room_manager: RoomManager,
+        auth: Arc<JwtAuthenticator>,
+        auth_timeout: Duration,
+    ) -> TestConnection {
         let (client_stream, server_stream) = duplex(4096);
         let (client_read, client_write) = tokio::io::split(client_stream);
         let (server_read, server_write) = tokio::io::split(server_stream);
 
-        let auth = test_authenticator();
         let mut conn = Connection::new(
-            ConnectionId(1),
+            id,
             test_addr(),
             server_read,
             server_write,
             Arc::clone(&auth) as Arc<dyn Authenticator>,
+            room_manager,
         )
         .with_auth_timeout(auth_timeout);
         let handle = conn.handle();
@@ -462,6 +610,7 @@ mod tests {
 
         for msg in [
             Message::JoinRoom(JoinRoomPayload { room_id: 1 }),
+            Message::LeaveRoom(LeaveRoomPayload { room_id: 1 }),
             Message::RoomMessage(RoomMessagePayload {
                 room_id: 1,
                 message: "hi".to_string(),
@@ -489,7 +638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn valid_auth_duplicate_auth_and_authenticated_room_message() {
+    async fn valid_auth_duplicate_auth_and_room_lifecycle() {
         let TestConnection {
             mut writer,
             mut reader,
@@ -529,6 +678,7 @@ mod tests {
             })
         );
 
+        // Sending to a room without joining returns 403 Forbidden.
         writer
             .write_frame(&Frame::new(Message::RoomMessage(RoomMessagePayload {
                 room_id: 5,
@@ -539,8 +689,241 @@ mod tests {
         assert_eq!(
             reader.read_frame().await.unwrap().unwrap().message,
             Message::Error(ErrorPayload {
+                code: ERR_FORBIDDEN,
+                message: "not subscribed to room 5".to_string(),
+            })
+        );
+
+        // Join room 5 -> Ack(5).
+        writer
+            .write_frame(&Frame::new(Message::JoinRoom(JoinRoomPayload {
+                room_id: 5,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.read_frame().await.unwrap().unwrap().message,
+            Message::Ack(AckPayload { message_id: 5 })
+        );
+
+        // Subscribed RoomMessage -> Ack(message_id).
+        writer
+            .write_frame(&Frame::new(Message::RoomMessage(RoomMessagePayload {
+                room_id: 5,
+                message: "ciphertext".to_string(),
+            })))
+            .await
+            .unwrap();
+        match reader.read_frame().await.unwrap().unwrap().message {
+            Message::Ack(ack) => assert!(ack.message_id >= 1),
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        // Leave room 5 -> Ack(5).
+        writer
+            .write_frame(&Frame::new(Message::LeaveRoom(LeaveRoomPayload {
+                room_id: 5,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.read_frame().await.unwrap().unwrap().message,
+            Message::Ack(AckPayload { message_id: 5 })
+        );
+
+        // Duplicate leave returns 400 Bad Request.
+        writer
+            .write_frame(&Frame::new(Message::LeaveRoom(LeaveRoomPayload {
+                room_id: 5,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.read_frame().await.unwrap().unwrap().message,
+            Message::Error(ErrorPayload {
+                code: ERR_BAD_REQUEST,
+                message: "not subscribed to room 5".to_string(),
+            })
+        );
+
+        // Private messages remain deferred to Phase 5 (501).
+        writer
+            .write_frame(&Frame::new(Message::PrivateMessage(
+                PrivateMessagePayload {
+                    recipient: "bob".to_string(),
+                    message: "ciphertext".to_string(),
+                },
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.read_frame().await.unwrap().unwrap().message,
+            Message::Error(ErrorPayload {
                 code: ERR_NOT_IMPLEMENTED,
                 message: "feature not yet implemented".to_string(),
+            })
+        );
+
+        drop(writer);
+        drop(reader);
+        join.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_connections_exchange_room_messages_and_cleanup_on_disconnect() {
+        let room_manager = RoomManager::new();
+        let auth = test_authenticator();
+
+        let alice = spawn_connection_with(
+            ConnectionId(1),
+            room_manager.clone(),
+            Arc::clone(&auth),
+            DEFAULT_AUTH_TIMEOUT,
+        );
+        let bob = spawn_connection_with(
+            ConnectionId(2),
+            room_manager.clone(),
+            Arc::clone(&auth),
+            DEFAULT_AUTH_TIMEOUT,
+        );
+
+        let mut alice_writer = alice.writer;
+        let mut alice_reader = alice.reader;
+        let mut bob_writer = bob.writer;
+        let mut bob_reader = bob.reader;
+
+        let alice_tok = auth
+            .issue_token("alice", Role::User, Duration::from_secs(60))
+            .unwrap();
+        let bob_tok = auth
+            .issue_token("bob", Role::User, Duration::from_secs(60))
+            .unwrap();
+
+        alice_writer
+            .write_frame(&Frame::new(Message::Auth(AuthPayload {
+                username: "alice".to_string(),
+                token: alice_tok,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            alice_reader.read_frame().await.unwrap().unwrap().message,
+            Message::AuthOk(AuthOkPayload)
+        );
+
+        bob_writer
+            .write_frame(&Frame::new(Message::Auth(AuthPayload {
+                username: "bob".to_string(),
+                token: bob_tok,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            bob_reader.read_frame().await.unwrap().unwrap().message,
+            Message::AuthOk(AuthOkPayload)
+        );
+
+        alice_writer
+            .write_frame(&Frame::new(Message::JoinRoom(JoinRoomPayload {
+                room_id: 42,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            alice_reader.read_frame().await.unwrap().unwrap().message,
+            Message::Ack(AckPayload { message_id: 42 })
+        );
+
+        bob_writer
+            .write_frame(&Frame::new(Message::JoinRoom(JoinRoomPayload {
+                room_id: 42,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            bob_reader.read_frame().await.unwrap().unwrap().message,
+            Message::Ack(AckPayload { message_id: 42 })
+        );
+        assert_eq!(room_manager.subscriber_count(42), 2);
+
+        let msg = RoomMessagePayload {
+            room_id: 42,
+            message: "hello bob".to_string(),
+        };
+        alice_writer
+            .write_frame(&Frame::new(Message::RoomMessage(msg.clone())))
+            .await
+            .unwrap();
+
+        match alice_reader.read_frame().await.unwrap().unwrap().message {
+            Message::Ack(ack) => assert_eq!(ack.message_id, 1),
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        assert_eq!(
+            bob_reader.read_frame().await.unwrap().unwrap().message,
+            Message::RoomMessage(msg)
+        );
+
+        drop(bob_writer);
+        drop(bob_reader);
+        bob.join.await.unwrap().unwrap();
+        assert_eq!(room_manager.subscriber_count(42), 1);
+
+        drop(alice_writer);
+        drop(alice_reader);
+        alice.join.await.unwrap().unwrap();
+        assert_eq!(room_manager.room_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_room_message_returns_400() {
+        let TestConnection {
+            mut writer,
+            mut reader,
+            handle: _handle,
+            auth,
+            shutdown_tx: _shutdown_tx,
+            join,
+        } = spawn_connection();
+
+        let token = auth
+            .issue_token("alice", Role::User, Duration::from_secs(60))
+            .unwrap();
+        writer
+            .write_frame(&Frame::new(Message::Auth(AuthPayload {
+                username: "alice".to_string(),
+                token,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.read_frame().await.unwrap().unwrap().message,
+            Message::AuthOk(AuthOkPayload)
+        );
+
+        writer
+            .write_frame(&Frame::new(Message::JoinRoom(JoinRoomPayload {
+                room_id: 9,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.read_frame().await.unwrap().unwrap().message,
+            Message::Ack(AckPayload { message_id: 9 })
+        );
+
+        writer
+            .write_frame(&Frame::new(Message::RoomMessage(RoomMessagePayload {
+                room_id: 9,
+                message: String::new(),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.read_frame().await.unwrap().unwrap().message,
+            Message::Error(ErrorPayload {
+                code: ERR_BAD_REQUEST,
+                message: "room message cannot be empty".to_string(),
             })
         );
 
@@ -753,6 +1136,7 @@ mod tests {
             server_read,
             server_write,
             test_authenticator(),
+            RoomManager::new(),
         );
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let join = tokio::spawn(async move { conn.run(shutdown_rx).await });
