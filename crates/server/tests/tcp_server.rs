@@ -8,10 +8,13 @@ use cluster::NodeInfo;
 use config::ServerConfig;
 use protocol::{
     AckPayload, AuthFailedPayload, AuthOkPayload, AuthPayload, Frame, HEADER_SIZE, JoinRoomPayload,
-    LeaveRoomPayload, MAGIC, Message, MessageType, PingPayload, PongPayload, RoomMessagePayload,
-    Version,
+    LeaveRoomPayload, MAGIC, Message, MessageType, PingPayload, PongPayload, PrivateMessagePayload,
+    RoomMessagePayload, Version,
 };
-use server::{ERR_PROTOCOL_ERROR, ERR_UNAUTHORIZED, FrameReader, FrameWriter, RoomManager, Server};
+use server::{
+    ERR_NOT_FOUND, ERR_PROTOCOL_ERROR, ERR_UNAUTHORIZED, FrameReader, FrameWriter, RoomManager,
+    Server, SessionRegistry,
+};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
@@ -20,6 +23,7 @@ struct TestServer {
     addr: SocketAddr,
     auth: Arc<JwtAuthenticator>,
     room_manager: RoomManager,
+    session_registry: SessionRegistry,
     active_connections: Arc<AtomicUsize>,
     shutdown_tx: oneshot::Sender<()>,
     server_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -40,6 +44,7 @@ async fn spawn_test_server() -> TestServer {
     let listener = server.bind().await.unwrap();
     let addr = listener.local_addr().unwrap();
     let room_manager = server.room_manager().clone();
+    let session_registry = server.session_registry().clone();
     let active_connections = server.active_connections_counter();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -55,6 +60,7 @@ async fn spawn_test_server() -> TestServer {
         addr,
         auth,
         room_manager,
+        session_registry,
         active_connections,
         shutdown_tx,
         server_handle,
@@ -114,10 +120,10 @@ async fn tcp_ping_pong_and_auth_lifecycle() {
     let TestServer {
         addr,
         auth,
-        room_manager: _room_manager,
         active_connections,
         shutdown_tx,
         server_handle,
+        ..
     } = spawn_test_server().await;
 
     let stream = TcpStream::connect(addr).await.unwrap();
@@ -183,10 +189,10 @@ async fn tcp_multiple_concurrent_clients() {
     let TestServer {
         addr,
         auth,
-        room_manager: _room_manager,
         active_connections,
         shutdown_tx,
         server_handle,
+        ..
     } = spawn_test_server().await;
 
     let mut clients = Vec::with_capacity(10);
@@ -224,11 +230,10 @@ async fn tcp_multiple_concurrent_clients() {
 async fn tcp_malformed_client_isolated_from_healthy_clients() {
     let TestServer {
         addr,
-        auth: _auth,
-        room_manager: _room_manager,
         active_connections,
         shutdown_tx,
         server_handle,
+        ..
     } = spawn_test_server().await;
 
     let bad_stream = TcpStream::connect(addr).await.unwrap();
@@ -277,10 +282,10 @@ async fn tcp_invalid_and_expired_jwt_rejected_and_dropped() {
     let TestServer {
         addr,
         auth,
-        room_manager: _room_manager,
         active_connections,
         shutdown_tx,
         server_handle,
+        ..
     } = spawn_test_server().await;
 
     // 1. Forged / garbage token -> AuthFailed + EOF.
@@ -398,10 +403,10 @@ async fn tcp_room_broadcast_multi_room_isolation_and_leave() {
     let TestServer {
         addr,
         auth,
-        room_manager: _room_manager,
         active_connections,
         shutdown_tx,
         server_handle,
+        ..
     } = spawn_test_server().await;
 
     let (mut alice_reader, mut alice_writer) =
@@ -539,6 +544,7 @@ async fn tcp_disconnect_cleans_up_room_subscriptions() {
         active_connections,
         shutdown_tx,
         server_handle,
+        ..
     } = spawn_test_server().await;
 
     let (mut r1, mut w1) = connect_authenticated_client(addr, &auth, "alice").await;
@@ -575,6 +581,186 @@ async fn tcp_disconnect_cleans_up_room_subscriptions() {
     })
     .await
     .expect("timed out waiting for second client's room cleanup");
+
+    wait_for_zero_connections(&active_connections).await;
+
+    shutdown_tx.send(()).unwrap();
+    server_handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn tcp_private_message_routing_multi_device_and_offline_404() {
+    let TestServer {
+        addr,
+        auth,
+        active_connections,
+        shutdown_tx,
+        server_handle,
+        ..
+    } = spawn_test_server().await;
+
+    let (mut alice_laptop_reader, mut alice_laptop_writer) =
+        connect_authenticated_client(addr, &auth, "alice").await;
+    let (mut alice_phone_reader, alice_phone_writer) =
+        connect_authenticated_client(addr, &auth, "alice").await;
+    let (mut bob_reader, mut bob_writer) = connect_authenticated_client(addr, &auth, "bob").await;
+    let (mut carol_reader, mut carol_writer) =
+        connect_authenticated_client(addr, &auth, "carol").await;
+
+    // 1. Bob sends a DM to Alice -> Bob gets Ack, both Alice devices receive DM, Carol receives nothing.
+    let bob_to_alice = PrivateMessagePayload {
+        recipient: "alice".to_string(),
+        message: "hi alice on both devices".to_string(),
+    };
+    bob_writer
+        .write_frame(&Frame::new(Message::PrivateMessage(bob_to_alice.clone())))
+        .await
+        .unwrap();
+    match bob_reader.read_frame().await.unwrap().unwrap().message {
+        Message::Ack(ack) => assert!(ack.message_id >= 1),
+        other => panic!("expected Ack, got {other:?}"),
+    }
+    assert_eq!(
+        alice_laptop_reader
+            .read_frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .message,
+        Message::PrivateMessage(bob_to_alice.clone())
+    );
+    assert_eq!(
+        alice_phone_reader
+            .read_frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .message,
+        Message::PrivateMessage(bob_to_alice)
+    );
+
+    carol_writer
+        .write_frame(&Frame::new(Message::Ping(PingPayload)))
+        .await
+        .unwrap();
+    assert_eq!(
+        carol_reader.read_frame().await.unwrap().unwrap().message,
+        Message::Pong(PongPayload)
+    );
+
+    // 2. Alice laptop sends a DM to Alice -> laptop gets Ack (no self-echo), phone receives DM.
+    let laptop_to_phone = PrivateMessagePayload {
+        recipient: "alice".to_string(),
+        message: "sync note".to_string(),
+    };
+    alice_laptop_writer
+        .write_frame(&Frame::new(Message::PrivateMessage(
+            laptop_to_phone.clone(),
+        )))
+        .await
+        .unwrap();
+    match alice_laptop_reader
+        .read_frame()
+        .await
+        .unwrap()
+        .unwrap()
+        .message
+    {
+        Message::Ack(ack) => assert!(ack.message_id >= 1),
+        other => panic!("expected Ack, got {other:?}"),
+    }
+    assert_eq!(
+        alice_phone_reader
+            .read_frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .message,
+        Message::PrivateMessage(laptop_to_phone)
+    );
+
+    alice_laptop_writer
+        .write_frame(&Frame::new(Message::Ping(PingPayload)))
+        .await
+        .unwrap();
+    assert_eq!(
+        alice_laptop_reader
+            .read_frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .message,
+        Message::Pong(PongPayload)
+    );
+
+    // 3. Bob sends a DM to offline user -> Error(404).
+    bob_writer
+        .write_frame(&Frame::new(Message::PrivateMessage(
+            PrivateMessagePayload {
+                recipient: "offline-user".to_string(),
+                message: "hello?".to_string(),
+            },
+        )))
+        .await
+        .unwrap();
+    match bob_reader.read_frame().await.unwrap().unwrap().message {
+        Message::Error(err) => assert_eq!(err.code, ERR_NOT_FOUND),
+        other => panic!("expected Error(404), got {other:?}"),
+    }
+
+    drop((
+        alice_laptop_writer,
+        alice_laptop_reader,
+        alice_phone_writer,
+        alice_phone_reader,
+        bob_writer,
+        bob_reader,
+        carol_writer,
+        carol_reader,
+    ));
+    wait_for_zero_connections(&active_connections).await;
+
+    shutdown_tx.send(()).unwrap();
+    server_handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn tcp_disconnect_cleans_up_session_registry_preserving_other_devices() {
+    let TestServer {
+        addr,
+        auth,
+        session_registry,
+        active_connections,
+        shutdown_tx,
+        server_handle,
+        ..
+    } = spawn_test_server().await;
+
+    let (r1, w1) = connect_authenticated_client(addr, &auth, "alice").await;
+    let (r2, w2) = connect_authenticated_client(addr, &auth, "alice").await;
+
+    assert_eq!(session_registry.session_count_for("alice"), 2);
+    assert_eq!(session_registry.online_user_count(), 1);
+
+    drop((w1, r1));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while session_registry.session_count_for("alice") != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for first device cleanup");
+    assert!(session_registry.is_online("alice"));
+
+    drop((w2, r2));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while session_registry.is_online("alice") {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for second device cleanup");
+    assert_eq!(session_registry.online_user_count(), 0);
 
     wait_for_zero_connections(&active_connections).await;
 
