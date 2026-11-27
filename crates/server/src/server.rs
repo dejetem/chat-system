@@ -12,6 +12,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::connection::{Connection, ConnectionId, DEFAULT_AUTH_TIMEOUT};
+use crate::room::RoomManager;
 
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -36,6 +37,7 @@ pub struct Server {
     config: ServerConfig,
     node: NodeInfo,
     authenticator: Arc<dyn Authenticator>,
+    room_manager: RoomManager,
     auth_timeout: Duration,
     active_connections: Arc<AtomicUsize>,
 }
@@ -51,9 +53,21 @@ impl Server {
             config,
             node,
             authenticator,
+            room_manager: RoomManager::new(),
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
             active_connections: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Replaces the [`RoomManager`] used by connections accepted by this server.
+    pub fn with_room_manager(mut self, room_manager: RoomManager) -> Self {
+        self.room_manager = room_manager;
+        self
+    }
+
+    /// Returns a reference to the server's [`RoomManager`].
+    pub fn room_manager(&self) -> &RoomManager {
+        &self.room_manager
     }
 
     /// Overrides the pre-authentication handshake timeout applied to accepted connections.
@@ -133,6 +147,7 @@ impl Server {
                             let conn_shutdown = shutdown_tx.subscribe();
                             let guard = ActiveConnectionGuard::new(Arc::clone(&self.active_connections));
                             let authenticator = Arc::clone(&self.authenticator);
+                            let room_manager = self.room_manager.clone();
                             let auth_timeout = self.auth_timeout;
 
                             tasks.spawn(async move {
@@ -143,6 +158,7 @@ impl Server {
                                     reader,
                                     writer,
                                     authenticator,
+                                    room_manager,
                                 )
                                 .with_auth_timeout(auth_timeout);
                                 if let Err(err) = conn.run(conn_shutdown).await {

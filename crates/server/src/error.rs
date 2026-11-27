@@ -6,6 +6,9 @@ pub const ERR_BAD_REQUEST: u16 = 400;
 /// Wire error code when an unauthenticated connection sends a restricted message.
 pub const ERR_UNAUTHORIZED: u16 = 401;
 
+/// Wire error code when an authenticated client attempts an action in a room it has not joined.
+pub const ERR_FORBIDDEN: u16 = 403;
+
 /// Wire error code when a frame violates the binary protocol specification.
 pub const ERR_PROTOCOL_ERROR: u16 = 422;
 
