@@ -15,6 +15,7 @@ use server::{
     ERR_NOT_FOUND, ERR_PROTOCOL_ERROR, ERR_UNAUTHORIZED, FrameReader, FrameWriter, RoomManager,
     Server, SessionRegistry,
 };
+use storage::{ChatStorage, InMemoryStorage};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
@@ -30,17 +31,35 @@ struct TestServer {
 }
 
 async fn spawn_test_server() -> TestServer {
+    spawn_test_server_internal(None, storage::DEFAULT_HISTORY_LIMIT).await
+}
+
+async fn spawn_test_server_with_storage(
+    storage: Arc<dyn ChatStorage>,
+    room_history_limit: usize,
+) -> TestServer {
+    spawn_test_server_internal(Some(storage), room_history_limit).await
+}
+
+async fn spawn_test_server_internal(
+    storage: Option<Arc<dyn ChatStorage>>,
+    room_history_limit: usize,
+) -> TestServer {
     let config = ServerConfig {
         host: "127.0.0.1".to_string(),
         port: 0,
     };
     let node = NodeInfo::new("test-node".to_string(), "local".to_string(), 0);
     let auth = Arc::new(JwtAuthenticator::from_secret("integration-test-secret").unwrap());
-    let server = Server::new(
+    let mut server = Server::new(
         config,
         node,
         Arc::clone(&auth) as Arc<dyn auth::Authenticator>,
-    );
+    )
+    .with_room_history_limit(room_history_limit);
+    if let Some(storage) = storage {
+        server = server.with_storage(storage);
+    }
     let listener = server.bind().await.unwrap();
     let addr = listener.local_addr().unwrap();
     let room_manager = server.room_manager().clone();
@@ -762,6 +781,143 @@ async fn tcp_disconnect_cleans_up_session_registry_preserving_other_devices() {
     .expect("timed out waiting for second device cleanup");
     assert_eq!(session_registry.online_user_count(), 0);
 
+    wait_for_zero_connections(&active_connections).await;
+
+    shutdown_tx.send(()).unwrap();
+    server_handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn tcp_room_join_replays_persisted_ciphertext_history() {
+    let storage = Arc::new(InMemoryStorage::new());
+    let TestServer {
+        addr,
+        auth,
+        active_connections,
+        shutdown_tx,
+        server_handle,
+        ..
+    } = spawn_test_server_with_storage(storage.clone() as Arc<dyn ChatStorage>, 2).await;
+
+    let (mut alice_reader, mut alice_writer) =
+        connect_authenticated_client(addr, &auth, "alice").await;
+
+    alice_writer
+        .write_frame(&Frame::new(Message::JoinRoom(JoinRoomPayload {
+            room_id: 55,
+        })))
+        .await
+        .unwrap();
+    assert_eq!(
+        alice_reader.read_frame().await.unwrap().unwrap().message,
+        Message::Ack(AckPayload { message_id: 55 })
+    );
+
+    // Send 3 ciphertexts while room_history_limit is 2.
+    for body in ["cipher-old", "cipher-mid", "cipher-new"] {
+        alice_writer
+            .write_frame(&Frame::new(Message::RoomMessage(RoomMessagePayload {
+                room_id: 55,
+                message: body.to_string(),
+            })))
+            .await
+            .unwrap();
+        match alice_reader.read_frame().await.unwrap().unwrap().message {
+            Message::Ack(ack) => assert!(ack.message_id >= 1),
+            other => panic!("expected Ack, got {other:?}"),
+        }
+    }
+
+    assert_eq!(storage.all_messages().len(), 3);
+
+    // Bob joins late -> receives Ack(55) followed by latest 2 messages in chronological order.
+    let (mut bob_reader, mut bob_writer) = connect_authenticated_client(addr, &auth, "bob").await;
+    bob_writer
+        .write_frame(&Frame::new(Message::JoinRoom(JoinRoomPayload {
+            room_id: 55,
+        })))
+        .await
+        .unwrap();
+    assert_eq!(
+        bob_reader.read_frame().await.unwrap().unwrap().message,
+        Message::Ack(AckPayload { message_id: 55 })
+    );
+
+    for expected in ["cipher-mid", "cipher-new"] {
+        assert_eq!(
+            bob_reader.read_frame().await.unwrap().unwrap().message,
+            Message::RoomMessage(RoomMessagePayload {
+                room_id: 55,
+                message: expected.to_string(),
+            })
+        );
+    }
+
+    drop((alice_writer, alice_reader, bob_writer, bob_reader));
+    wait_for_zero_connections(&active_connections).await;
+
+    shutdown_tx.send(()).unwrap();
+    server_handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn tcp_offline_private_messages_flushed_on_reconnect() {
+    let storage = Arc::new(InMemoryStorage::new());
+    let TestServer {
+        addr,
+        auth,
+        active_connections,
+        shutdown_tx,
+        server_handle,
+        ..
+    } = spawn_test_server_with_storage(storage.clone() as Arc<dyn ChatStorage>, 50).await;
+
+    let (mut alice_reader, mut alice_writer) =
+        connect_authenticated_client(addr, &auth, "alice").await;
+
+    for body in ["queued-cipher-1", "queued-cipher-2"] {
+        alice_writer
+            .write_frame(&Frame::new(Message::PrivateMessage(
+                PrivateMessagePayload {
+                    recipient: "bob".to_string(),
+                    message: body.to_string(),
+                },
+            )))
+            .await
+            .unwrap();
+        match alice_reader.read_frame().await.unwrap().unwrap().message {
+            Message::Ack(ack) => assert!(ack.message_id >= 1),
+            other => panic!("expected Ack, got {other:?}"),
+        }
+    }
+    assert_eq!(storage.offline_message_count("bob").await.unwrap(), 2);
+
+    // Bob connects and authenticates -> immediately receives queued DMs after AuthOk.
+    let (mut bob_reader, bob_writer) = connect_authenticated_client(addr, &auth, "bob").await;
+    for expected in ["queued-cipher-1", "queued-cipher-2"] {
+        assert_eq!(
+            bob_reader.read_frame().await.unwrap().unwrap().message,
+            Message::PrivateMessage(PrivateMessagePayload {
+                recipient: "bob".to_string(),
+                message: expected.to_string(),
+            })
+        );
+    }
+    assert_eq!(storage.offline_message_count("bob").await.unwrap(), 0);
+
+    // Reconnecting again yields no duplicate replays.
+    drop((bob_writer, bob_reader));
+    let (mut bob2_reader, mut bob2_writer) = connect_authenticated_client(addr, &auth, "bob").await;
+    bob2_writer
+        .write_frame(&Frame::new(Message::Ping(PingPayload)))
+        .await
+        .unwrap();
+    assert_eq!(
+        bob2_reader.read_frame().await.unwrap().unwrap().message,
+        Message::Pong(PongPayload)
+    );
+
+    drop((alice_writer, alice_reader, bob2_writer, bob2_reader));
     wait_for_zero_connections(&active_connections).await;
 
     shutdown_tx.send(()).unwrap();
