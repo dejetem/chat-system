@@ -7,6 +7,7 @@ use anyhow::Context;
 use auth::Authenticator;
 use cluster::NodeInfo;
 use config::ServerConfig;
+use storage::{ChatStorage, DEFAULT_HISTORY_LIMIT};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -40,6 +41,8 @@ pub struct Server {
     authenticator: Arc<dyn Authenticator>,
     room_manager: RoomManager,
     session_registry: SessionRegistry,
+    storage: Option<Arc<dyn ChatStorage>>,
+    room_history_limit: usize,
     auth_timeout: Duration,
     active_connections: Arc<AtomicUsize>,
 }
@@ -58,6 +61,8 @@ impl Server {
             authenticator,
             room_manager: RoomManager::new(),
             session_registry,
+            storage: None,
+            room_history_limit: DEFAULT_HISTORY_LIMIT,
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
             active_connections: Arc::new(AtomicUsize::new(0)),
         }
@@ -83,6 +88,23 @@ impl Server {
     /// Returns a reference to the server's [`SessionRegistry`].
     pub fn session_registry(&self) -> &SessionRegistry {
         &self.session_registry
+    }
+
+    /// Attaches a persistent [`ChatStorage`] backend used by accepted connections.
+    pub fn with_storage(mut self, storage: Arc<dyn ChatStorage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// Overrides the maximum number of historical messages replayed when a client joins a room.
+    pub fn with_room_history_limit(mut self, room_history_limit: usize) -> Self {
+        self.room_history_limit = room_history_limit;
+        self
+    }
+
+    /// Returns a reference to the attached [`ChatStorage`] backend, if configured.
+    pub fn storage(&self) -> Option<&Arc<dyn ChatStorage>> {
+        self.storage.as_ref()
     }
 
     /// Overrides the pre-authentication handshake timeout applied to accepted connections.
@@ -164,6 +186,8 @@ impl Server {
                             let authenticator = Arc::clone(&self.authenticator);
                             let room_manager = self.room_manager.clone();
                             let session_registry = self.session_registry.clone();
+                            let storage = self.storage.clone();
+                            let room_history_limit = self.room_history_limit;
                             let auth_timeout = self.auth_timeout;
 
                             tasks.spawn(async move {
@@ -177,7 +201,11 @@ impl Server {
                                     room_manager,
                                     session_registry,
                                 )
-                                .with_auth_timeout(auth_timeout);
+                                .with_auth_timeout(auth_timeout)
+                                .with_room_history_limit(room_history_limit);
+                                if let Some(storage) = storage {
+                                    conn = conn.with_storage(storage);
+                                }
                                 if let Err(err) = conn.run(conn_shutdown).await {
                                     tracing::debug!(
                                         connection_id = %conn_id,

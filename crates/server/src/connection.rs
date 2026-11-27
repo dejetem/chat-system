@@ -6,15 +6,18 @@ use std::time::Duration;
 use auth::{AuthenticatedUser, Authenticator};
 use protocol::{
     AckPayload, AuthFailedPayload, AuthOkPayload, ErrorPayload, Frame, Message, PongPayload,
-    ProtocolError,
+    PrivateMessagePayload, ProtocolError, RoomMessagePayload,
+};
+use storage::{
+    ChatStorage, DEFAULT_HISTORY_LIMIT, MediaRef, NewPrivateMessage, NewRoomMessage, StorageError,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::error::{SendError, TrySendError};
 use tokio::sync::{mpsc, watch};
 
 use crate::error::{
-    ConnectionError, ERR_BAD_REQUEST, ERR_FORBIDDEN, ERR_NOT_FOUND, ERR_PROTOCOL_ERROR,
-    ERR_UNAUTHORIZED,
+    ConnectionError, ERR_BAD_REQUEST, ERR_FORBIDDEN, ERR_INTERNAL_ERROR, ERR_NOT_FOUND,
+    ERR_PROTOCOL_ERROR, ERR_UNAUTHORIZED,
 };
 use crate::framed::{FrameReader, FrameWriter};
 use crate::room::RoomManager;
@@ -127,6 +130,8 @@ pub struct Connection<R, W> {
     authenticator: Arc<dyn Authenticator>,
     room_manager: RoomManager,
     session_registry: SessionRegistry,
+    storage: Option<Arc<dyn ChatStorage>>,
+    room_history_limit: usize,
     auth_timeout: Duration,
 }
 
@@ -170,6 +175,8 @@ where
             authenticator,
             room_manager,
             session_registry,
+            storage: None,
+            room_history_limit: DEFAULT_HISTORY_LIMIT,
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
         }
     }
@@ -177,6 +184,18 @@ where
     /// Overrides the pre-authentication handshake timeout for this connection.
     pub fn with_auth_timeout(mut self, auth_timeout: Duration) -> Self {
         self.auth_timeout = auth_timeout;
+        self
+    }
+
+    /// Attaches a persistent [`ChatStorage`] backend to this connection.
+    pub fn with_storage(mut self, storage: Arc<dyn ChatStorage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// Overrides the maximum number of historical messages replayed on `JoinRoom`.
+    pub fn with_room_history_limit(mut self, room_history_limit: usize) -> Self {
+        self.room_history_limit = room_history_limit;
         self
     }
 
@@ -315,6 +334,43 @@ where
         .await
     }
 
+    async fn send_storage_error(
+        &mut self,
+        action: &str,
+        err: StorageError,
+    ) -> Result<(), ConnectionError> {
+        match err {
+            StorageError::Validation(msg) => self.send_error(ERR_BAD_REQUEST, msg).await,
+            StorageError::NotFound(msg) => self.send_error(ERR_NOT_FOUND, msg).await,
+            other => {
+                tracing::error!(
+                    connection_id = %self.id,
+                    peer = %self.peer_addr,
+                    action,
+                    error = %other,
+                    "storage operation failed"
+                );
+                self.send_error(ERR_INTERNAL_ERROR, "internal storage error")
+                    .await
+            }
+        }
+    }
+
+    fn decode_utf8_payload(&self, message_id: u64, bytes: Vec<u8>) -> Option<String> {
+        match String::from_utf8(bytes) {
+            Ok(text) => Some(text),
+            Err(err) => {
+                tracing::warn!(
+                    connection_id = %self.id,
+                    message_id,
+                    error = %err,
+                    "skipping non-UTF-8 stored message payload during TCP replay"
+                );
+                None
+            }
+        }
+    }
+
     async fn handle_frame(&mut self, frame: Frame) -> Result<bool, ConnectionError> {
         match frame.message {
             Message::Ping(_) => {
@@ -337,13 +393,23 @@ where
                     .authenticate(&payload.username, &payload.token)
                 {
                     Ok(user) => {
+                        if let Some(storage) = self.storage.clone()
+                            && let Err(err) = storage
+                                .upsert_user(&user.username, &user.role.to_string())
+                                .await
+                        {
+                            self.send_storage_error("upsert_user", err).await?;
+                            return Ok(true);
+                        }
+
                         let reg = self
                             .session_registry
                             .register(user.username.clone(), self.handle());
+                        let username = user.username.clone();
                         tracing::info!(
                             connection_id = %self.id,
                             peer = %self.peer_addr,
-                            username = %user.username,
+                            %username,
                             role = %user.role,
                             node_id = %self.session_registry.node_id(),
                             active_sessions = reg.active_sessions,
@@ -351,6 +417,36 @@ where
                         );
                         self.state = ConnectionState::Authenticated(user);
                         self.send_message(Message::AuthOk(AuthOkPayload)).await?;
+
+                        if let Some(storage) = self.storage.clone() {
+                            match storage.flush_offline_messages(&username).await {
+                                Ok(queued) => {
+                                    for record in queued {
+                                        if let Some(message) = self.decode_utf8_payload(
+                                            record.message_id,
+                                            record.ciphertext,
+                                        ) {
+                                            self.send_message(Message::PrivateMessage(
+                                                PrivateMessagePayload {
+                                                    recipient: username.clone(),
+                                                    message,
+                                                },
+                                            ))
+                                            .await?;
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::error!(
+                                        connection_id = %self.id,
+                                        %username,
+                                        error = %err,
+                                        "failed to flush offline messages on login"
+                                    );
+                                }
+                            }
+                        }
+
                         Ok(true)
                     }
                     Err(err) => {
@@ -374,16 +470,49 @@ where
                     return Ok(true);
                 }
 
+                let history = if let Some(storage) = self.storage.clone() {
+                    if let Err(err) = storage.ensure_room(payload.room_id, None, None).await {
+                        self.send_storage_error("ensure_room", err).await?;
+                        return Ok(true);
+                    }
+                    match storage
+                        .fetch_room_history(payload.room_id, self.room_history_limit)
+                        .await
+                    {
+                        Ok(records) => records,
+                        Err(err) => {
+                            self.send_storage_error("fetch_room_history", err).await?;
+                            return Ok(true);
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+
                 self.room_manager.join_room(payload.room_id, self.handle());
                 tracing::debug!(
                     connection_id = %self.id,
                     room_id = payload.room_id,
+                    history_count = history.len(),
                     "joined room"
                 );
                 self.send_message(Message::Ack(AckPayload {
                     message_id: payload.room_id,
                 }))
                 .await?;
+
+                for record in history {
+                    if let Some(message) =
+                        self.decode_utf8_payload(record.message_id, record.ciphertext)
+                    {
+                        self.send_message(Message::RoomMessage(RoomMessagePayload {
+                            room_id: payload.room_id,
+                            message,
+                        }))
+                        .await?;
+                    }
+                }
+
                 Ok(true)
             }
             Message::LeaveRoom(payload) => {
@@ -436,7 +565,28 @@ where
                 }
 
                 let room_id = payload.room_id;
-                let message_id = self.room_manager.next_message_id();
+                let message_id = if let Some(storage) = self.storage.clone() {
+                    let sender_username = self.state.username().unwrap_or_default().to_string();
+                    let media_key = MediaRef::extract_from_payload(&payload.message);
+                    match storage
+                        .store_room_message(NewRoomMessage {
+                            sender_username,
+                            room_id,
+                            ciphertext: payload.message.as_bytes().to_vec(),
+                            media_key,
+                        })
+                        .await
+                    {
+                        Ok(stored) => stored.message_id,
+                        Err(err) => {
+                            self.send_storage_error("store_room_message", err).await?;
+                            return Ok(true);
+                        }
+                    }
+                } else {
+                    self.room_manager.next_message_id()
+                };
+
                 let broadcast_frame = Frame::new(Message::RoomMessage(payload));
                 self.room_manager
                     .broadcast(room_id, broadcast_frame, Some(self.id))
@@ -464,14 +614,49 @@ where
                     return Ok(true);
                 }
 
+                let sender_username = self.state.username().unwrap_or_default().to_string();
                 let recipient = payload.recipient.clone();
+                let raw_ciphertext = payload.message.as_bytes().to_vec();
+                let media_key = MediaRef::extract_from_payload(&payload.message);
                 let dm_frame = Frame::new(Message::PrivateMessage(payload));
-                match self
+
+                let delivery = self
                     .session_registry
                     .send_to_user(&recipient, dm_frame, Some(self.id))
-                    .await
-                {
-                    DirectDelivery::DeliveredLocal { delivered, .. } => {
+                    .await;
+
+                match (delivery, self.storage.clone()) {
+                    (DirectDelivery::DeliveredLocal { delivered, .. }, Some(storage)) => {
+                        match storage
+                            .store_private_message(NewPrivateMessage {
+                                sender_username,
+                                recipient_username: recipient.clone(),
+                                ciphertext: raw_ciphertext,
+                                media_key,
+                                queue_offline: false,
+                            })
+                            .await
+                        {
+                            Ok(stored) => {
+                                let message_id = stored.message_id;
+                                tracing::debug!(
+                                    connection_id = %self.id,
+                                    %recipient,
+                                    message_id,
+                                    delivered,
+                                    "delivered and persisted private message"
+                                );
+                                self.send_message(Message::Ack(AckPayload { message_id }))
+                                    .await?;
+                            }
+                            Err(err) => {
+                                self.send_storage_error("store_private_message", err)
+                                    .await?;
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    (DirectDelivery::DeliveredLocal { delivered, .. }, None) => {
                         let message_id = self.session_registry.next_message_id();
                         tracing::debug!(
                             connection_id = %self.id,
@@ -483,7 +668,60 @@ where
                         self.send_message(Message::Ack(AckPayload { message_id }))
                             .await?;
                     }
-                    DirectDelivery::RecipientNotLocal => {
+                    (DirectDelivery::RecipientNotLocal, Some(storage)) => {
+                        // TODO(Phase 7): Query Redis session registry and publish to remote node channel before buffering offline.
+                        match storage
+                            .store_private_message(NewPrivateMessage {
+                                sender_username,
+                                recipient_username: recipient.clone(),
+                                ciphertext: raw_ciphertext,
+                                media_key,
+                                queue_offline: true,
+                            })
+                            .await
+                        {
+                            Ok(stored) => {
+                                let message_id = stored.message_id;
+                                tracing::debug!(
+                                    connection_id = %self.id,
+                                    %recipient,
+                                    message_id,
+                                    "buffered offline private message"
+                                );
+                                self.send_message(Message::Ack(AckPayload { message_id }))
+                                    .await?;
+
+                                if self.session_registry.is_online(&recipient)
+                                    && let Ok(queued) =
+                                        storage.flush_offline_messages(&recipient).await
+                                {
+                                    for record in queued {
+                                        if let Some(msg) = self.decode_utf8_payload(
+                                            record.message_id,
+                                            record.ciphertext,
+                                        ) {
+                                            let frame = Frame::new(Message::PrivateMessage(
+                                                PrivateMessagePayload {
+                                                    recipient: recipient.clone(),
+                                                    message: msg,
+                                                },
+                                            ));
+                                            let _ = self
+                                                .session_registry
+                                                .send_to_user(&recipient, frame, None)
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                self.send_storage_error("store_offline_private_message", err)
+                                    .await?;
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    (DirectDelivery::RecipientNotLocal, None) => {
                         // TODO(Phase 7): Query Redis session registry and publish to remote node channel if online elsewhere.
                         self.send_error(
                             ERR_NOT_FOUND,
@@ -515,6 +753,7 @@ mod tests {
         JoinRoomPayload, LeaveRoomPayload, MAGIC, Message, MessageType, PingPayload, PongPayload,
         PrivateMessagePayload, ProtocolError, RoomMessagePayload, Version,
     };
+    use storage::{ChatStorage, InMemoryStorage};
     use tokio::io::{AsyncWriteExt, duplex};
     use tokio::sync::watch;
 
@@ -578,6 +817,45 @@ mod tests {
         auth: Arc<JwtAuthenticator>,
         auth_timeout: Duration,
     ) -> TestConnection {
+        spawn_connection_full(
+            id,
+            room_manager,
+            session_registry,
+            auth,
+            auth_timeout,
+            None,
+            storage::DEFAULT_HISTORY_LIMIT,
+        )
+    }
+
+    fn spawn_connection_with_storage(
+        id: ConnectionId,
+        room_manager: RoomManager,
+        session_registry: SessionRegistry,
+        auth: Arc<JwtAuthenticator>,
+        storage: Arc<dyn ChatStorage>,
+        room_history_limit: usize,
+    ) -> TestConnection {
+        spawn_connection_full(
+            id,
+            room_manager,
+            session_registry,
+            auth,
+            DEFAULT_AUTH_TIMEOUT,
+            Some(storage),
+            room_history_limit,
+        )
+    }
+
+    fn spawn_connection_full(
+        id: ConnectionId,
+        room_manager: RoomManager,
+        session_registry: SessionRegistry,
+        auth: Arc<JwtAuthenticator>,
+        auth_timeout: Duration,
+        storage: Option<Arc<dyn ChatStorage>>,
+        room_history_limit: usize,
+    ) -> TestConnection {
         let (client_stream, server_stream) = duplex(4096);
         let (client_read, client_write) = tokio::io::split(client_stream);
         let (server_read, server_write) = tokio::io::split(server_stream);
@@ -591,7 +869,11 @@ mod tests {
             room_manager,
             session_registry,
         )
-        .with_auth_timeout(auth_timeout);
+        .with_auth_timeout(auth_timeout)
+        .with_room_history_limit(room_history_limit);
+        if let Some(storage) = storage {
+            conn = conn.with_storage(storage);
+        }
         let handle = conn.handle();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -1499,5 +1781,254 @@ mod tests {
         assert_eq!(reader.read_frame().await.unwrap(), None);
         let state = join.await.unwrap().unwrap();
         assert_eq!(state, ConnectionState::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn join_room_replays_persisted_ciphertext_history_in_order() {
+        let room_manager = RoomManager::new();
+        let session_registry = SessionRegistry::new();
+        let auth = test_authenticator();
+        let storage = Arc::new(InMemoryStorage::new());
+        let storage_trait: Arc<dyn ChatStorage> = storage.clone();
+
+        let alice = spawn_connection_with_storage(
+            ConnectionId(1),
+            room_manager.clone(),
+            session_registry.clone(),
+            Arc::clone(&auth),
+            Arc::clone(&storage_trait),
+            50,
+        );
+        let mut alice_writer = alice.writer;
+        let mut alice_reader = alice.reader;
+
+        let alice_token = auth
+            .issue_token("alice", Role::User, Duration::from_secs(60))
+            .unwrap();
+        alice_writer
+            .write_frame(&Frame::new(Message::Auth(AuthPayload {
+                username: "alice".to_string(),
+                token: alice_token,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            alice_reader.read_frame().await.unwrap().unwrap().message,
+            Message::AuthOk(AuthOkPayload)
+        );
+
+        alice_writer
+            .write_frame(&Frame::new(Message::JoinRoom(JoinRoomPayload {
+                room_id: 10,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            alice_reader.read_frame().await.unwrap().unwrap().message,
+            Message::Ack(AckPayload { message_id: 10 })
+        );
+
+        let ciphertexts = ["cipher-msg-1", "cipher-msg-2", "cipher-msg-3"];
+        for (idx, body) in ciphertexts.iter().enumerate() {
+            alice_writer
+                .write_frame(&Frame::new(Message::RoomMessage(RoomMessagePayload {
+                    room_id: 10,
+                    message: (*body).to_string(),
+                })))
+                .await
+                .unwrap();
+            match alice_reader.read_frame().await.unwrap().unwrap().message {
+                Message::Ack(ack) => assert_eq!(ack.message_id, (idx + 1) as u64),
+                other => panic!("expected Ack, got {other:?}"),
+            }
+        }
+
+        // Verify opaque ciphertext bytes persisted inside storage.
+        let persisted = storage.all_messages();
+        assert_eq!(persisted.len(), 3);
+        assert_eq!(persisted[0].ciphertext, b"cipher-msg-1");
+        assert_eq!(persisted[2].ciphertext, b"cipher-msg-3");
+
+        // Bob connects later and joins room 10 -> gets Ack(10) followed by chronological history.
+        let bob = spawn_connection_with_storage(
+            ConnectionId(2),
+            room_manager,
+            session_registry,
+            Arc::clone(&auth),
+            storage_trait,
+            50,
+        );
+        let mut bob_writer = bob.writer;
+        let mut bob_reader = bob.reader;
+
+        let bob_token = auth
+            .issue_token("bob", Role::User, Duration::from_secs(60))
+            .unwrap();
+        bob_writer
+            .write_frame(&Frame::new(Message::Auth(AuthPayload {
+                username: "bob".to_string(),
+                token: bob_token,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            bob_reader.read_frame().await.unwrap().unwrap().message,
+            Message::AuthOk(AuthOkPayload)
+        );
+
+        bob_writer
+            .write_frame(&Frame::new(Message::JoinRoom(JoinRoomPayload {
+                room_id: 10,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            bob_reader.read_frame().await.unwrap().unwrap().message,
+            Message::Ack(AckPayload { message_id: 10 })
+        );
+
+        for expected in ciphertexts {
+            assert_eq!(
+                bob_reader.read_frame().await.unwrap().unwrap().message,
+                Message::RoomMessage(RoomMessagePayload {
+                    room_id: 10,
+                    message: expected.to_string(),
+                })
+            );
+        }
+
+        drop((alice_writer, alice_reader, bob_writer, bob_reader));
+        alice.join.await.unwrap().unwrap();
+        bob.join.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn offline_private_messages_buffered_and_flushed_on_reconnect() {
+        let room_manager = RoomManager::new();
+        let session_registry = SessionRegistry::new();
+        let auth = test_authenticator();
+        let storage = Arc::new(InMemoryStorage::new());
+        let storage_trait: Arc<dyn ChatStorage> = storage.clone();
+
+        let alice = spawn_connection_with_storage(
+            ConnectionId(1),
+            room_manager.clone(),
+            session_registry.clone(),
+            Arc::clone(&auth),
+            Arc::clone(&storage_trait),
+            50,
+        );
+        let mut alice_writer = alice.writer;
+        let mut alice_reader = alice.reader;
+
+        let alice_token = auth
+            .issue_token("alice", Role::User, Duration::from_secs(60))
+            .unwrap();
+        alice_writer
+            .write_frame(&Frame::new(Message::Auth(AuthPayload {
+                username: "alice".to_string(),
+                token: alice_token,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            alice_reader.read_frame().await.unwrap().unwrap().message,
+            Message::AuthOk(AuthOkPayload)
+        );
+
+        // Bob is offline: Alice receives Acks and messages queue in offline_messages.
+        for (idx, body) in ["offline-cipher-1", "offline-cipher-2"].iter().enumerate() {
+            alice_writer
+                .write_frame(&Frame::new(Message::PrivateMessage(
+                    PrivateMessagePayload {
+                        recipient: "bob".to_string(),
+                        message: (*body).to_string(),
+                    },
+                )))
+                .await
+                .unwrap();
+            match alice_reader.read_frame().await.unwrap().unwrap().message {
+                Message::Ack(ack) => assert_eq!(ack.message_id, (idx + 1) as u64),
+                other => panic!("expected Ack, got {other:?}"),
+            }
+        }
+        assert_eq!(storage.offline_message_count("bob").await.unwrap(), 2);
+
+        // Bob connects and authenticates -> receives AuthOk then both buffered DMs in order.
+        let bob = spawn_connection_with_storage(
+            ConnectionId(2),
+            room_manager.clone(),
+            session_registry.clone(),
+            Arc::clone(&auth),
+            Arc::clone(&storage_trait),
+            50,
+        );
+        let mut bob_writer = bob.writer;
+        let mut bob_reader = bob.reader;
+
+        let bob_token = auth
+            .issue_token("bob", Role::User, Duration::from_secs(60))
+            .unwrap();
+        bob_writer
+            .write_frame(&Frame::new(Message::Auth(AuthPayload {
+                username: "bob".to_string(),
+                token: bob_token.clone(),
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            bob_reader.read_frame().await.unwrap().unwrap().message,
+            Message::AuthOk(AuthOkPayload)
+        );
+
+        for expected in ["offline-cipher-1", "offline-cipher-2"] {
+            assert_eq!(
+                bob_reader.read_frame().await.unwrap().unwrap().message,
+                Message::PrivateMessage(PrivateMessagePayload {
+                    recipient: "bob".to_string(),
+                    message: expected.to_string(),
+                })
+            );
+        }
+        assert_eq!(storage.offline_message_count("bob").await.unwrap(), 0);
+
+        drop((bob_writer, bob_reader));
+        bob.join.await.unwrap().unwrap();
+
+        // Subsequent reconnect gets 0 duplicate replays.
+        let bob_reconnect = spawn_connection_with_storage(
+            ConnectionId(3),
+            room_manager,
+            session_registry,
+            Arc::clone(&auth),
+            storage_trait,
+            50,
+        );
+        let mut bob_r2_writer = bob_reconnect.writer;
+        let mut bob_r2_reader = bob_reconnect.reader;
+
+        bob_r2_writer
+            .write_frame(&Frame::new(Message::Auth(AuthPayload {
+                username: "bob".to_string(),
+                token: bob_token,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            bob_r2_reader.read_frame().await.unwrap().unwrap().message,
+            Message::AuthOk(AuthOkPayload)
+        );
+        bob_r2_writer
+            .write_frame(&Frame::new(Message::Ping(PingPayload)))
+            .await
+            .unwrap();
+        assert_eq!(
+            bob_r2_reader.read_frame().await.unwrap().unwrap().message,
+            Message::Pong(PongPayload)
+        );
+
+        drop((alice_writer, alice_reader, bob_r2_writer, bob_r2_reader));
+        alice.join.await.unwrap().unwrap();
+        bob_reconnect.join.await.unwrap().unwrap();
     }
 }

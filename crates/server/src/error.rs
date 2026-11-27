@@ -15,6 +15,9 @@ pub const ERR_NOT_FOUND: u16 = 404;
 /// Wire error code when a frame violates the binary protocol specification.
 pub const ERR_PROTOCOL_ERROR: u16 = 422;
 
+/// Wire error code when an internal server or persistence operation fails.
+pub const ERR_INTERNAL_ERROR: u16 = 500;
+
 /// Wire error code for protocol messages whose backend handlers belong to later phases.
 pub const ERR_NOT_IMPLEMENTED: u16 = 501;
 

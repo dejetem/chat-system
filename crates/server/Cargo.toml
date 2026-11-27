@@ -9,6 +9,7 @@ auth = { path = "../auth" }
 cluster = { path = "../cluster" }
 config = { path = "../config" }
 protocol = { path = "../protocol" }
+storage = { path = "../storage" }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
