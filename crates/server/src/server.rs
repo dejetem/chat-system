@@ -13,6 +13,7 @@ use tokio::task::JoinSet;
 
 use crate::connection::{Connection, ConnectionId, DEFAULT_AUTH_TIMEOUT};
 use crate::room::RoomManager;
+use crate::session::SessionRegistry;
 
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,6 +39,7 @@ pub struct Server {
     node: NodeInfo,
     authenticator: Arc<dyn Authenticator>,
     room_manager: RoomManager,
+    session_registry: SessionRegistry,
     auth_timeout: Duration,
     active_connections: Arc<AtomicUsize>,
 }
@@ -49,11 +51,13 @@ impl Server {
         node: NodeInfo,
         authenticator: Arc<dyn Authenticator>,
     ) -> Self {
+        let session_registry = SessionRegistry::for_node(node.node_id.clone());
         Self {
             config,
             node,
             authenticator,
             room_manager: RoomManager::new(),
+            session_registry,
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
             active_connections: Arc::new(AtomicUsize::new(0)),
         }
@@ -68,6 +72,17 @@ impl Server {
     /// Returns a reference to the server's [`RoomManager`].
     pub fn room_manager(&self) -> &RoomManager {
         &self.room_manager
+    }
+
+    /// Replaces the [`SessionRegistry`] used by connections accepted by this server.
+    pub fn with_session_registry(mut self, session_registry: SessionRegistry) -> Self {
+        self.session_registry = session_registry;
+        self
+    }
+
+    /// Returns a reference to the server's [`SessionRegistry`].
+    pub fn session_registry(&self) -> &SessionRegistry {
+        &self.session_registry
     }
 
     /// Overrides the pre-authentication handshake timeout applied to accepted connections.
@@ -148,6 +163,7 @@ impl Server {
                             let guard = ActiveConnectionGuard::new(Arc::clone(&self.active_connections));
                             let authenticator = Arc::clone(&self.authenticator);
                             let room_manager = self.room_manager.clone();
+                            let session_registry = self.session_registry.clone();
                             let auth_timeout = self.auth_timeout;
 
                             tasks.spawn(async move {
@@ -159,6 +175,7 @@ impl Server {
                                     writer,
                                     authenticator,
                                     room_manager,
+                                    session_registry,
                                 )
                                 .with_auth_timeout(auth_timeout);
                                 if let Err(err) = conn.run(conn_shutdown).await {
