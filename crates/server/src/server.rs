@@ -7,12 +7,14 @@ use anyhow::Context;
 use auth::Authenticator;
 use cluster::NodeInfo;
 use config::ServerConfig;
+use storage::{ChatStorage, DEFAULT_HISTORY_LIMIT};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::connection::{Connection, ConnectionId, DEFAULT_AUTH_TIMEOUT};
 use crate::room::RoomManager;
+use crate::session::SessionRegistry;
 
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,6 +40,9 @@ pub struct Server {
     node: NodeInfo,
     authenticator: Arc<dyn Authenticator>,
     room_manager: RoomManager,
+    session_registry: SessionRegistry,
+    storage: Option<Arc<dyn ChatStorage>>,
+    room_history_limit: usize,
     auth_timeout: Duration,
     active_connections: Arc<AtomicUsize>,
 }
@@ -49,11 +54,15 @@ impl Server {
         node: NodeInfo,
         authenticator: Arc<dyn Authenticator>,
     ) -> Self {
+        let session_registry = SessionRegistry::for_node(node.node_id.clone());
         Self {
             config,
             node,
             authenticator,
             room_manager: RoomManager::new(),
+            session_registry,
+            storage: None,
+            room_history_limit: DEFAULT_HISTORY_LIMIT,
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
             active_connections: Arc::new(AtomicUsize::new(0)),
         }
@@ -68,6 +77,34 @@ impl Server {
     /// Returns a reference to the server's [`RoomManager`].
     pub fn room_manager(&self) -> &RoomManager {
         &self.room_manager
+    }
+
+    /// Replaces the [`SessionRegistry`] used by connections accepted by this server.
+    pub fn with_session_registry(mut self, session_registry: SessionRegistry) -> Self {
+        self.session_registry = session_registry;
+        self
+    }
+
+    /// Returns a reference to the server's [`SessionRegistry`].
+    pub fn session_registry(&self) -> &SessionRegistry {
+        &self.session_registry
+    }
+
+    /// Attaches a persistent [`ChatStorage`] backend used by accepted connections.
+    pub fn with_storage(mut self, storage: Arc<dyn ChatStorage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// Overrides the maximum number of historical messages replayed when a client joins a room.
+    pub fn with_room_history_limit(mut self, room_history_limit: usize) -> Self {
+        self.room_history_limit = room_history_limit;
+        self
+    }
+
+    /// Returns a reference to the attached [`ChatStorage`] backend, if configured.
+    pub fn storage(&self) -> Option<&Arc<dyn ChatStorage>> {
+        self.storage.as_ref()
     }
 
     /// Overrides the pre-authentication handshake timeout applied to accepted connections.
@@ -148,6 +185,9 @@ impl Server {
                             let guard = ActiveConnectionGuard::new(Arc::clone(&self.active_connections));
                             let authenticator = Arc::clone(&self.authenticator);
                             let room_manager = self.room_manager.clone();
+                            let session_registry = self.session_registry.clone();
+                            let storage = self.storage.clone();
+                            let room_history_limit = self.room_history_limit;
                             let auth_timeout = self.auth_timeout;
 
                             tasks.spawn(async move {
@@ -159,8 +199,13 @@ impl Server {
                                     writer,
                                     authenticator,
                                     room_manager,
+                                    session_registry,
                                 )
-                                .with_auth_timeout(auth_timeout);
+                                .with_auth_timeout(auth_timeout)
+                                .with_room_history_limit(room_history_limit);
+                                if let Some(storage) = storage {
+                                    conn = conn.with_storage(storage);
+                                }
                                 if let Err(err) = conn.run(conn_shutdown).await {
                                     tracing::debug!(
                                         connection_id = %conn_id,

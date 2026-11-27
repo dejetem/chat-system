@@ -1,6 +1,6 @@
 use crate::{
-    auth::AuthConfig, cluster::ClusterConfig, database::DatabaseConfig, redis::RedisConfig,
-    server::ServerConfig,
+    auth::AuthConfig, cluster::ClusterConfig, database::DatabaseConfig, media::MediaConfig,
+    redis::RedisConfig, server::ServerConfig,
 };
 
 #[derive(Debug, Clone)]
@@ -10,4 +10,5 @@ pub struct Config {
     pub redis: RedisConfig,
     pub cluster: ClusterConfig,
     pub auth: AuthConfig,
+    pub media: MediaConfig,
 }
