@@ -9,6 +9,9 @@ pub const ERR_UNAUTHORIZED: u16 = 401;
 /// Wire error code when an authenticated client attempts an action in a room it has not joined.
 pub const ERR_FORBIDDEN: u16 = 403;
 
+/// Wire error code when a target resource or recipient user is not found or offline.
+pub const ERR_NOT_FOUND: u16 = 404;
+
 /// Wire error code when a frame violates the binary protocol specification.
 pub const ERR_PROTOCOL_ERROR: u16 = 422;
 
