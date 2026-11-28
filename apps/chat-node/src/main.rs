@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use auth::JwtAuthenticator;
 use cluster::NodeInfo;
 use config::Config;
+use pubsub::RedisPubSub;
 use server::Server;
 use storage::{PgStorage, S3Config, S3MediaStorage};
 
@@ -61,12 +62,21 @@ async fn main() -> Result<()> {
         tracing::info!("S3 media storage credentials not configured; object client disabled");
     }
 
-    // TODO: Connect Redis
+    // Connect Redis Pub/Sub broker
+    let redis_pubsub = RedisPubSub::connect(&config.redis, &node.node_id)
+        .await
+        .context("failed to connect Redis Pub/Sub broker")?;
+    tracing::info!(
+        node_id = %node.node_id,
+        key_prefix = %config.redis.key_prefix,
+        "Redis Pub/Sub broker connected"
+    );
 
     // TODO: Start Cluster
 
     let server = Server::new(config.server, node, authenticator)
         .with_storage(Arc::new(pg_storage))
+        .with_pubsub(Arc::new(redis_pubsub))
         .with_room_history_limit(config.database.room_history_limit)
         .with_auth_timeout(Duration::from_secs(config.auth.auth_timeout_secs));
     server.run().await?;
