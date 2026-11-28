@@ -103,15 +103,16 @@ impl RoomManager {
         true
     }
 
-    /// Removes `conn_id` from all subscribed rooms, returning how many rooms were left.
-    pub fn remove_connection(&self, conn_id: ConnectionId) -> usize {
+    /// Removes `conn_id` from all subscribed rooms, returning the left room IDs in sorted order.
+    pub fn remove_connection_rooms(&self, conn_id: ConnectionId) -> Vec<RoomId> {
         let mut state = self.inner.write().expect("room manager lock poisoned");
         let Some(joined_rooms) = state.subscriptions.remove(&conn_id) else {
-            return 0;
+            return Vec::new();
         };
 
-        let removed_count = joined_rooms.len();
+        let mut left_rooms = Vec::with_capacity(joined_rooms.len());
         for room_id in joined_rooms {
+            left_rooms.push(room_id);
             if let Some(subscribers) = state.rooms.get_mut(&room_id) {
                 subscribers.remove(&conn_id);
                 if subscribers.is_empty() {
@@ -120,7 +121,13 @@ impl RoomManager {
             }
         }
 
-        removed_count
+        left_rooms.sort_unstable();
+        left_rooms
+    }
+
+    /// Removes `conn_id` from all subscribed rooms, returning how many rooms were left.
+    pub fn remove_connection(&self, conn_id: ConnectionId) -> usize {
+        self.remove_connection_rooms(conn_id).len()
     }
 
     /// Returns `true` if `conn_id` is currently subscribed to `room_id`.

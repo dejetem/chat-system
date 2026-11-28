@@ -7,10 +7,12 @@ use anyhow::Context;
 use auth::Authenticator;
 use cluster::NodeInfo;
 use config::ServerConfig;
+use protocol::{Frame, Message, PrivateMessagePayload, RoomMessagePayload};
+use pubsub::{PubSubBackend, PubSubEnvelope};
 use storage::{ChatStorage, DEFAULT_HISTORY_LIMIT};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
-use tokio::task::JoinSet;
+use tokio::sync::{broadcast, watch};
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::connection::{Connection, ConnectionId, DEFAULT_AUTH_TIMEOUT};
 use crate::room::RoomManager;
@@ -42,6 +44,7 @@ pub struct Server {
     room_manager: RoomManager,
     session_registry: SessionRegistry,
     storage: Option<Arc<dyn ChatStorage>>,
+    pubsub: Option<Arc<dyn PubSubBackend>>,
     room_history_limit: usize,
     auth_timeout: Duration,
     active_connections: Arc<AtomicUsize>,
@@ -62,6 +65,7 @@ impl Server {
             room_manager: RoomManager::new(),
             session_registry,
             storage: None,
+            pubsub: None,
             room_history_limit: DEFAULT_HISTORY_LIMIT,
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
             active_connections: Arc::new(AtomicUsize::new(0)),
@@ -105,6 +109,17 @@ impl Server {
     /// Returns a reference to the attached [`ChatStorage`] backend, if configured.
     pub fn storage(&self) -> Option<&Arc<dyn ChatStorage>> {
         self.storage.as_ref()
+    }
+
+    /// Attaches a distributed [`PubSubBackend`] used for cross-node room and direct routing.
+    pub fn with_pubsub(mut self, pubsub: Arc<dyn PubSubBackend>) -> Self {
+        self.pubsub = Some(pubsub);
+        self
+    }
+
+    /// Returns a reference to the attached [`PubSubBackend`], if configured.
+    pub fn pubsub(&self) -> Option<&Arc<dyn PubSubBackend>> {
+        self.pubsub.as_ref()
     }
 
     /// Overrides the pre-authentication handshake timeout applied to accepted connections.
@@ -161,6 +176,21 @@ impl Server {
         let next_conn_id = AtomicU64::new(1);
         let mut tasks = JoinSet::new();
 
+        let relay_handle: Option<JoinHandle<()>> = self.pubsub.as_ref().map(|pubsub| {
+            let events_rx = pubsub.subscribe_events();
+            let local_node_id = pubsub.node_id().to_string();
+            let room_manager = self.room_manager.clone();
+            let session_registry = self.session_registry.clone();
+            let relay_shutdown = shutdown_tx.subscribe();
+            tokio::spawn(run_pubsub_relay(
+                local_node_id,
+                room_manager,
+                session_registry,
+                events_rx,
+                relay_shutdown,
+            ))
+        });
+
         tokio::pin!(shutdown);
 
         loop {
@@ -187,6 +217,7 @@ impl Server {
                             let room_manager = self.room_manager.clone();
                             let session_registry = self.session_registry.clone();
                             let storage = self.storage.clone();
+                            let pubsub = self.pubsub.clone();
                             let room_history_limit = self.room_history_limit;
                             let auth_timeout = self.auth_timeout;
 
@@ -205,6 +236,9 @@ impl Server {
                                 .with_room_history_limit(room_history_limit);
                                 if let Some(storage) = storage {
                                     conn = conn.with_storage(storage);
+                                }
+                                if let Some(pubsub) = pubsub {
+                                    conn = conn.with_pubsub(pubsub);
                                 }
                                 if let Err(err) = conn.run(conn_shutdown).await {
                                     tracing::debug!(
@@ -254,8 +288,83 @@ impl Server {
             tasks.shutdown().await;
         }
 
+        if let Some(handle) = relay_handle
+            && let Err(err) = handle.await
+        {
+            tracing::warn!(error = %err, "Pub/Sub relay task ended unexpectedly");
+        }
+        if let Some(pubsub) = &self.pubsub
+            && let Err(err) = pubsub.shutdown().await
+        {
+            tracing::warn!(node_id = %self.node.node_id, error = %err, "failed to shut down Pub/Sub backend cleanly");
+        }
+
         tracing::info!(node_id = %self.node.node_id, "TCP server shut down cleanly");
         Ok(())
+    }
+}
+
+async fn run_pubsub_relay(
+    local_node_id: String,
+    room_manager: RoomManager,
+    session_registry: SessionRegistry,
+    mut events_rx: broadcast::Receiver<PubSubEnvelope>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed_res = shutdown_rx.changed() => {
+                match changed_res {
+                    Ok(()) if *shutdown_rx.borrow() => break,
+                    Ok(()) => {}
+                    Err(_) => break,
+                }
+            }
+            recv_res = events_rx.recv() => {
+                match recv_res {
+                    Ok(PubSubEnvelope::RoomBroadcast {
+                        origin_node_id,
+                        room_id,
+                        message,
+                        ..
+                    }) => {
+                        if origin_node_id == local_node_id {
+                            continue;
+                        }
+                        let frame = Frame::new(Message::RoomMessage(RoomMessagePayload {
+                            room_id,
+                            message,
+                        }));
+                        room_manager.broadcast(room_id, frame, None).await;
+                    }
+                    Ok(PubSubEnvelope::DirectMessage {
+                        target_node_id,
+                        recipient_username,
+                        message,
+                        ..
+                    }) => {
+                        if target_node_id != local_node_id {
+                            continue;
+                        }
+                        let frame = Frame::new(Message::PrivateMessage(PrivateMessagePayload {
+                            recipient: recipient_username.clone(),
+                            message,
+                        }));
+                        session_registry
+                            .send_to_user(&recipient_username, frame, None)
+                            .await;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            node_id = %local_node_id,
+                            skipped,
+                            "inbound Pub/Sub relay lagged and skipped envelopes"
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
     }
 }
 

@@ -8,6 +8,7 @@ use protocol::{
     AckPayload, AuthFailedPayload, AuthOkPayload, ErrorPayload, Frame, Message, PongPayload,
     PrivateMessagePayload, ProtocolError, RoomMessagePayload,
 };
+use pubsub::{PubSubBackend, PubSubEnvelope, PubSubError};
 use storage::{
     ChatStorage, DEFAULT_HISTORY_LIMIT, MediaRef, NewPrivateMessage, NewRoomMessage, StorageError,
 };
@@ -131,6 +132,7 @@ pub struct Connection<R, W> {
     room_manager: RoomManager,
     session_registry: SessionRegistry,
     storage: Option<Arc<dyn ChatStorage>>,
+    pubsub: Option<Arc<dyn PubSubBackend>>,
     room_history_limit: usize,
     auth_timeout: Duration,
 }
@@ -176,6 +178,7 @@ where
             room_manager,
             session_registry,
             storage: None,
+            pubsub: None,
             room_history_limit: DEFAULT_HISTORY_LIMIT,
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
         }
@@ -190,6 +193,12 @@ where
     /// Attaches a persistent [`ChatStorage`] backend to this connection.
     pub fn with_storage(mut self, storage: Arc<dyn ChatStorage>) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    /// Attaches a distributed [`PubSubBackend`] to this connection.
+    pub fn with_pubsub(mut self, pubsub: Arc<dyn PubSubBackend>) -> Self {
+        self.pubsub = Some(pubsub);
         self
     }
 
@@ -212,13 +221,37 @@ where
     /// Runs the connection event loop until the peer disconnects, errors, or shutdown is signaled.
     pub async fn run(&mut self, shutdown_rx: watch::Receiver<bool>) -> Result<(), ConnectionError> {
         let result = self.run_loop(shutdown_rx).await;
-        let rooms_cleaned = self.room_manager.remove_connection(self.id);
+        let left_rooms = self.room_manager.remove_connection_rooms(self.id);
         let session_removed = self.session_registry.remove_connection(self.id);
-        if rooms_cleaned > 0 {
+
+        if let Some(pubsub) = self.pubsub.clone() {
+            for room_id in &left_rooms {
+                if let Err(err) = pubsub.unsubscribe_room(*room_id).await {
+                    tracing::warn!(
+                        connection_id = %self.id,
+                        room_id,
+                        error = %err,
+                        "failed to unsubscribe room from Pub/Sub on disconnect"
+                    );
+                }
+            }
+            if let Some(unreg) = &session_removed
+                && let Err(err) = pubsub.unregister_user_session(&unreg.username).await
+            {
+                tracing::warn!(
+                    connection_id = %self.id,
+                    username = %unreg.username,
+                    error = %err,
+                    "failed to unregister user session from Pub/Sub on disconnect"
+                );
+            }
+        }
+
+        if !left_rooms.is_empty() {
             tracing::debug!(
                 connection_id = %self.id,
                 peer = %self.peer_addr,
-                rooms_cleaned,
+                rooms_cleaned = left_rooms.len(),
                 "cleaned up room subscriptions on disconnect"
             );
         }
@@ -356,6 +389,27 @@ where
         }
     }
 
+    async fn send_pubsub_error(
+        &mut self,
+        action: &str,
+        err: PubSubError,
+    ) -> Result<(), ConnectionError> {
+        match err {
+            PubSubError::Validation(msg) => self.send_error(ERR_BAD_REQUEST, msg).await,
+            other => {
+                tracing::error!(
+                    connection_id = %self.id,
+                    peer = %self.peer_addr,
+                    action,
+                    error = %other,
+                    "pubsub operation failed"
+                );
+                self.send_error(ERR_INTERNAL_ERROR, "internal pubsub error")
+                    .await
+            }
+        }
+    }
+
     fn decode_utf8_payload(&self, message_id: u64, bytes: Vec<u8>) -> Option<String> {
         match String::from_utf8(bytes) {
             Ok(text) => Some(text),
@@ -406,6 +460,13 @@ where
                             .session_registry
                             .register(user.username.clone(), self.handle());
                         let username = user.username.clone();
+                        if let Some(pubsub) = self.pubsub.clone()
+                            && let Err(err) = pubsub.register_user_session(&username).await
+                        {
+                            self.session_registry.remove_connection(self.id);
+                            self.send_pubsub_error("register_user_session", err).await?;
+                            return Ok(true);
+                        }
                         tracing::info!(
                             connection_id = %self.id,
                             peer = %self.peer_addr,
@@ -489,7 +550,15 @@ where
                     Vec::new()
                 };
 
-                self.room_manager.join_room(payload.room_id, self.handle());
+                let newly_joined = self.room_manager.join_room(payload.room_id, self.handle());
+                if newly_joined
+                    && let Some(pubsub) = self.pubsub.clone()
+                    && let Err(err) = pubsub.subscribe_room(payload.room_id).await
+                {
+                    self.room_manager.leave_room(payload.room_id, self.id);
+                    self.send_pubsub_error("subscribe_room", err).await?;
+                    return Ok(true);
+                }
                 tracing::debug!(
                     connection_id = %self.id,
                     room_id = payload.room_id,
@@ -531,6 +600,17 @@ where
                     return Ok(true);
                 }
 
+                if let Some(pubsub) = self.pubsub.clone()
+                    && let Err(err) = pubsub.unsubscribe_room(payload.room_id).await
+                {
+                    tracing::warn!(
+                        connection_id = %self.id,
+                        room_id = payload.room_id,
+                        error = %err,
+                        "failed to unsubscribe room from Pub/Sub on LeaveRoom"
+                    );
+                }
+
                 tracing::debug!(
                     connection_id = %self.id,
                     room_id = payload.room_id,
@@ -565,14 +645,15 @@ where
                 }
 
                 let room_id = payload.room_id;
+                let sender_username = self.state.username().unwrap_or_default().to_string();
+                let raw_message = payload.message.clone();
                 let message_id = if let Some(storage) = self.storage.clone() {
-                    let sender_username = self.state.username().unwrap_or_default().to_string();
-                    let media_key = MediaRef::extract_from_payload(&payload.message);
+                    let media_key = MediaRef::extract_from_payload(&raw_message);
                     match storage
                         .store_room_message(NewRoomMessage {
-                            sender_username,
+                            sender_username: sender_username.clone(),
                             room_id,
-                            ciphertext: payload.message.as_bytes().to_vec(),
+                            ciphertext: raw_message.as_bytes().to_vec(),
                             media_key,
                         })
                         .await
@@ -591,6 +672,21 @@ where
                 self.room_manager
                     .broadcast(room_id, broadcast_frame, Some(self.id))
                     .await;
+
+                if let Some(pubsub) = self.pubsub.clone() {
+                    let envelope = PubSubEnvelope::RoomBroadcast {
+                        origin_node_id: pubsub.node_id().to_string(),
+                        room_id,
+                        sender_username,
+                        message_id,
+                        message: raw_message,
+                    };
+                    if let Err(err) = pubsub.publish_room(&envelope).await {
+                        self.send_pubsub_error("publish_room", err).await?;
+                        return Ok(true);
+                    }
+                }
+
                 self.send_message(Message::Ack(AckPayload { message_id }))
                     .await?;
                 Ok(true)
@@ -616,17 +712,64 @@ where
 
                 let sender_username = self.state.username().unwrap_or_default().to_string();
                 let recipient = payload.recipient.clone();
-                let raw_ciphertext = payload.message.as_bytes().to_vec();
-                let media_key = MediaRef::extract_from_payload(&payload.message);
+                let raw_message = payload.message.clone();
+                let raw_ciphertext = raw_message.as_bytes().to_vec();
+                let media_key = MediaRef::extract_from_payload(&raw_message);
                 let dm_frame = Frame::new(Message::PrivateMessage(payload));
 
                 let delivery = self
                     .session_registry
                     .send_to_user(&recipient, dm_frame, Some(self.id))
                     .await;
+                let delivered_local = matches!(delivery, DirectDelivery::DeliveredLocal { .. });
 
-                match (delivery, self.storage.clone()) {
-                    (DirectDelivery::DeliveredLocal { delivered, .. }, Some(storage)) => {
+                let mut delivered_remote = 0usize;
+                if let Some(pubsub) = self.pubsub.clone() {
+                    let nodes = match pubsub.lookup_user_nodes(&recipient).await {
+                        Ok(nodes) => nodes,
+                        Err(err) => {
+                            self.send_pubsub_error("lookup_user_nodes", err).await?;
+                            return Ok(true);
+                        }
+                    };
+                    let local_node_id = pubsub.node_id().to_string();
+                    for target_node in nodes {
+                        if target_node == local_node_id {
+                            continue;
+                        }
+                        let envelope = PubSubEnvelope::DirectMessage {
+                            origin_node_id: local_node_id.clone(),
+                            target_node_id: target_node.clone(),
+                            sender_username: sender_username.clone(),
+                            recipient_username: recipient.clone(),
+                            message_id: None,
+                            message: raw_message.clone(),
+                        };
+                        match pubsub.publish_direct(&target_node, &envelope).await {
+                            Ok(receivers) if receivers > 0 => {
+                                delivered_remote += 1;
+                            }
+                            Ok(_) => {
+                                tracing::debug!(
+                                    connection_id = %self.id,
+                                    %recipient,
+                                    stale_node = %target_node,
+                                    "pruning stale remote node from user session index"
+                                );
+                                let _ =
+                                    pubsub.prune_stale_user_node(&recipient, &target_node).await;
+                            }
+                            Err(err) => {
+                                self.send_pubsub_error("publish_direct", err).await?;
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+
+                let delivered_any = delivered_local || delivered_remote > 0;
+                match (delivered_any, self.storage.clone()) {
+                    (true, Some(storage)) => {
                         match storage
                             .store_private_message(NewPrivateMessage {
                                 sender_username,
@@ -643,7 +786,8 @@ where
                                     connection_id = %self.id,
                                     %recipient,
                                     message_id,
-                                    delivered,
+                                    delivered_local,
+                                    delivered_remote,
                                     "delivered and persisted private message"
                                 );
                                 self.send_message(Message::Ack(AckPayload { message_id }))
@@ -656,20 +800,20 @@ where
                             }
                         }
                     }
-                    (DirectDelivery::DeliveredLocal { delivered, .. }, None) => {
+                    (true, None) => {
                         let message_id = self.session_registry.next_message_id();
                         tracing::debug!(
                             connection_id = %self.id,
                             %recipient,
                             message_id,
-                            delivered,
+                            delivered_local,
+                            delivered_remote,
                             "delivered private message"
                         );
                         self.send_message(Message::Ack(AckPayload { message_id }))
                             .await?;
                     }
-                    (DirectDelivery::RecipientNotLocal, Some(storage)) => {
-                        // TODO(Phase 7): Query Redis session registry and publish to remote node channel before buffering offline.
+                    (false, Some(storage)) => {
                         match storage
                             .store_private_message(NewPrivateMessage {
                                 sender_username,
@@ -721,8 +865,7 @@ where
                             }
                         }
                     }
-                    (DirectDelivery::RecipientNotLocal, None) => {
-                        // TODO(Phase 7): Query Redis session registry and publish to remote node channel if online elsewhere.
+                    (false, None) => {
                         self.send_error(
                             ERR_NOT_FOUND,
                             format!("recipient '{recipient}' is not online"),
@@ -753,6 +896,7 @@ mod tests {
         JoinRoomPayload, LeaveRoomPayload, MAGIC, Message, MessageType, PingPayload, PongPayload,
         PrivateMessagePayload, ProtocolError, RoomMessagePayload, Version,
     };
+    use pubsub::{InMemoryPubSubHub, PubSubBackend, PubSubEnvelope};
     use storage::{ChatStorage, InMemoryStorage};
     use tokio::io::{AsyncWriteExt, duplex};
     use tokio::sync::watch;
@@ -824,6 +968,7 @@ mod tests {
             auth,
             auth_timeout,
             None,
+            None,
             storage::DEFAULT_HISTORY_LIMIT,
         )
     }
@@ -843,10 +988,12 @@ mod tests {
             auth,
             DEFAULT_AUTH_TIMEOUT,
             Some(storage),
+            None,
             room_history_limit,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_connection_full(
         id: ConnectionId,
         room_manager: RoomManager,
@@ -854,6 +1001,7 @@ mod tests {
         auth: Arc<JwtAuthenticator>,
         auth_timeout: Duration,
         storage: Option<Arc<dyn ChatStorage>>,
+        pubsub: Option<Arc<dyn PubSubBackend>>,
         room_history_limit: usize,
     ) -> TestConnection {
         let (client_stream, server_stream) = duplex(4096);
@@ -873,6 +1021,9 @@ mod tests {
         .with_room_history_limit(room_history_limit);
         if let Some(storage) = storage {
             conn = conn.with_storage(storage);
+        }
+        if let Some(pubsub) = pubsub {
+            conn = conn.with_pubsub(pubsub);
         }
         let handle = conn.handle();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2030,5 +2181,163 @@ mod tests {
         drop((alice_writer, alice_reader, bob_r2_writer, bob_r2_reader));
         alice.join.await.unwrap().unwrap();
         bob_reconnect.join.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cross_node_room_and_private_messages_route_via_pubsub_hub() {
+        let hub = InMemoryPubSubHub::default();
+        let pubsub1 = Arc::new(hub.node("node-1"));
+        let pubsub2 = Arc::new(hub.node("node-2"));
+        let mut rx2 = pubsub2.subscribe_events();
+
+        let auth = test_authenticator();
+        let node1_rooms = RoomManager::new();
+        let node1_sessions = SessionRegistry::for_node("node-1");
+        let node2_rooms = RoomManager::new();
+        let node2_sessions = SessionRegistry::for_node("node-2");
+
+        let alice = spawn_connection_full(
+            ConnectionId(1),
+            node1_rooms,
+            node1_sessions,
+            Arc::clone(&auth),
+            DEFAULT_AUTH_TIMEOUT,
+            None,
+            Some(pubsub1.clone() as Arc<dyn PubSubBackend>),
+            50,
+        );
+        let bob = spawn_connection_full(
+            ConnectionId(2),
+            node2_rooms,
+            node2_sessions,
+            Arc::clone(&auth),
+            DEFAULT_AUTH_TIMEOUT,
+            None,
+            Some(pubsub2.clone() as Arc<dyn PubSubBackend>),
+            50,
+        );
+
+        let mut alice_writer = alice.writer;
+        let mut alice_reader = alice.reader;
+        let mut bob_writer = bob.writer;
+        let mut bob_reader = bob.reader;
+
+        for (username, writer, reader) in [
+            ("alice", &mut alice_writer, &mut alice_reader),
+            ("bob", &mut bob_writer, &mut bob_reader),
+        ] {
+            let token = auth
+                .issue_token(username, Role::User, Duration::from_secs(60))
+                .unwrap();
+            writer
+                .write_frame(&Frame::new(Message::Auth(AuthPayload {
+                    username: username.to_string(),
+                    token,
+                })))
+                .await
+                .unwrap();
+            assert_eq!(
+                reader.read_frame().await.unwrap().unwrap().message,
+                Message::AuthOk(AuthOkPayload)
+            );
+        }
+
+        // Bob on node-2 joins room 30 -> node-2 subscribes to cluster room 30.
+        bob_writer
+            .write_frame(&Frame::new(Message::JoinRoom(JoinRoomPayload {
+                room_id: 30,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            bob_reader.read_frame().await.unwrap().unwrap().message,
+            Message::Ack(AckPayload { message_id: 30 })
+        );
+        assert!(hub.is_node_subscribed_to_room("node-2", 30));
+
+        // Alice on node-1 joins and publishes to room 30 -> pubsub2 receives RoomBroadcast envelope.
+        alice_writer
+            .write_frame(&Frame::new(Message::JoinRoom(JoinRoomPayload {
+                room_id: 30,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            alice_reader.read_frame().await.unwrap().unwrap().message,
+            Message::Ack(AckPayload { message_id: 30 })
+        );
+        alice_writer
+            .write_frame(&Frame::new(Message::RoomMessage(RoomMessagePayload {
+                room_id: 30,
+                message: "cipher-cross-node".to_string(),
+            })))
+            .await
+            .unwrap();
+        match alice_reader.read_frame().await.unwrap().unwrap().message {
+            Message::Ack(ack) => assert!(ack.message_id >= 1),
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        assert_eq!(
+            rx2.try_recv().unwrap(),
+            PubSubEnvelope::RoomBroadcast {
+                origin_node_id: "node-1".to_string(),
+                room_id: 30,
+                sender_username: "alice".to_string(),
+                message_id: 1,
+                message: "cipher-cross-node".to_string(),
+            }
+        );
+
+        // Alice DMs Bob -> Ack + DirectMessage envelope published to node-2.
+        alice_writer
+            .write_frame(&Frame::new(Message::PrivateMessage(
+                PrivateMessagePayload {
+                    recipient: "bob".to_string(),
+                    message: "cipher-dm-cross-node".to_string(),
+                },
+            )))
+            .await
+            .unwrap();
+        match alice_reader.read_frame().await.unwrap().unwrap().message {
+            Message::Ack(ack) => assert!(ack.message_id >= 1),
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        assert_eq!(
+            rx2.try_recv().unwrap(),
+            PubSubEnvelope::DirectMessage {
+                origin_node_id: "node-1".to_string(),
+                target_node_id: "node-2".to_string(),
+                sender_username: "alice".to_string(),
+                recipient_username: "bob".to_string(),
+                message_id: None,
+                message: "cipher-dm-cross-node".to_string(),
+            }
+        );
+
+        // Bob disconnects from node-2 -> room 30 unsubscribes & subsequent DM returns 404.
+        drop((bob_writer, bob_reader));
+        bob.join.await.unwrap().unwrap();
+        assert!(!hub.is_node_subscribed_to_room("node-2", 30));
+
+        alice_writer
+            .write_frame(&Frame::new(Message::PrivateMessage(
+                PrivateMessagePayload {
+                    recipient: "bob".to_string(),
+                    message: "after disconnect".to_string(),
+                },
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            alice_reader.read_frame().await.unwrap().unwrap().message,
+            Message::Error(ErrorPayload {
+                code: ERR_NOT_FOUND,
+                message: "recipient 'bob' is not online".to_string(),
+            })
+        );
+
+        drop((alice_writer, alice_reader));
+        alice.join.await.unwrap().unwrap();
+        assert!(!hub.is_node_subscribed_to_room("node-1", 30));
     }
 }
