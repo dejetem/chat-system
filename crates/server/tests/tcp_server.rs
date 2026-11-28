@@ -11,6 +11,7 @@ use protocol::{
     LeaveRoomPayload, MAGIC, Message, MessageType, PingPayload, PongPayload, PrivateMessagePayload,
     RoomMessagePayload, Version,
 };
+use pubsub::{InMemoryPubSubHub, PubSubBackend};
 use server::{
     ERR_NOT_FOUND, ERR_PROTOCOL_ERROR, ERR_UNAUTHORIZED, FrameReader, FrameWriter, RoomManager,
     Server, SessionRegistry,
@@ -31,25 +32,41 @@ struct TestServer {
 }
 
 async fn spawn_test_server() -> TestServer {
-    spawn_test_server_internal(None, storage::DEFAULT_HISTORY_LIMIT).await
+    spawn_test_server_internal("test-node", None, storage::DEFAULT_HISTORY_LIMIT, None).await
 }
 
 async fn spawn_test_server_with_storage(
     storage: Arc<dyn ChatStorage>,
     room_history_limit: usize,
 ) -> TestServer {
-    spawn_test_server_internal(Some(storage), room_history_limit).await
+    spawn_test_server_internal("test-node", Some(storage), room_history_limit, None).await
+}
+
+async fn spawn_cluster_node(
+    node_id: &str,
+    storage: Arc<dyn ChatStorage>,
+    pubsub: Arc<dyn PubSubBackend>,
+) -> TestServer {
+    spawn_test_server_internal(
+        node_id,
+        Some(storage),
+        storage::DEFAULT_HISTORY_LIMIT,
+        Some(pubsub),
+    )
+    .await
 }
 
 async fn spawn_test_server_internal(
+    node_id: &str,
     storage: Option<Arc<dyn ChatStorage>>,
     room_history_limit: usize,
+    pubsub: Option<Arc<dyn PubSubBackend>>,
 ) -> TestServer {
     let config = ServerConfig {
         host: "127.0.0.1".to_string(),
         port: 0,
     };
-    let node = NodeInfo::new("test-node".to_string(), "local".to_string(), 0);
+    let node = NodeInfo::new(node_id.to_string(), "local".to_string(), 0);
     let auth = Arc::new(JwtAuthenticator::from_secret("integration-test-secret").unwrap());
     let mut server = Server::new(
         config,
@@ -59,6 +76,9 @@ async fn spawn_test_server_internal(
     .with_room_history_limit(room_history_limit);
     if let Some(storage) = storage {
         server = server.with_storage(storage);
+    }
+    if let Some(pubsub) = pubsub {
+        server = server.with_pubsub(pubsub);
     }
     let listener = server.bind().await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -922,4 +942,206 @@ async fn tcp_offline_private_messages_flushed_on_reconnect() {
 
     shutdown_tx.send(()).unwrap();
     server_handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn tcp_cross_node_room_broadcast_and_dynamic_unsubscribe() {
+    let storage = Arc::new(InMemoryStorage::new());
+    let hub = InMemoryPubSubHub::default();
+    let pubsub1 = Arc::new(hub.node("node-1"));
+    let pubsub2 = Arc::new(hub.node("node-2"));
+
+    let node1 = spawn_cluster_node(
+        "node-1",
+        storage.clone() as Arc<dyn ChatStorage>,
+        pubsub1.clone() as Arc<dyn PubSubBackend>,
+    )
+    .await;
+    let node2 = spawn_cluster_node(
+        "node-2",
+        storage.clone() as Arc<dyn ChatStorage>,
+        pubsub2.clone() as Arc<dyn PubSubBackend>,
+    )
+    .await;
+
+    let (mut alice_reader, mut alice_writer) =
+        connect_authenticated_client(node1.addr, &node1.auth, "alice").await;
+    let (mut bob_reader, mut bob_writer) =
+        connect_authenticated_client(node2.addr, &node2.auth, "bob").await;
+    let (mut carol_reader, mut carol_writer) =
+        connect_authenticated_client(node2.addr, &node2.auth, "carol").await;
+
+    // Alice (node-1) and Bob (node-2) join room 77; Carol (node-2) joins room 88.
+    for (r, w, room_id) in [
+        (&mut alice_reader, &mut alice_writer, 77u64),
+        (&mut bob_reader, &mut bob_writer, 77u64),
+        (&mut carol_reader, &mut carol_writer, 88u64),
+    ] {
+        w.write_frame(&Frame::new(Message::JoinRoom(JoinRoomPayload { room_id })))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.read_frame().await.unwrap().unwrap().message,
+            Message::Ack(AckPayload {
+                message_id: room_id
+            })
+        );
+    }
+
+    assert!(hub.is_node_subscribed_to_room("node-1", 77));
+    assert!(hub.is_node_subscribed_to_room("node-2", 77));
+    assert!(hub.is_node_subscribed_to_room("node-2", 88));
+
+    // Alice sends a RoomMessage on node-1 -> Bob on node-2 receives it, DB stores 1 copy, Alice gets Ack with no echo.
+    let msg1 = RoomMessagePayload {
+        room_id: 77,
+        message: "cipher-cross-node-1".to_string(),
+    };
+    alice_writer
+        .write_frame(&Frame::new(Message::RoomMessage(msg1.clone())))
+        .await
+        .unwrap();
+    match alice_reader.read_frame().await.unwrap().unwrap().message {
+        Message::Ack(ack) => assert_eq!(ack.message_id, 1),
+        other => panic!("expected Ack, got {other:?}"),
+    }
+    assert_eq!(
+        bob_reader.read_frame().await.unwrap().unwrap().message,
+        Message::RoomMessage(msg1)
+    );
+    assert_eq!(storage.all_messages().len(), 1);
+
+    // Ensure Alice received no self-echo (Ping -> immediate Pong) and Carol (room 88) stayed isolated.
+    alice_writer
+        .write_frame(&Frame::new(Message::Ping(PingPayload)))
+        .await
+        .unwrap();
+    assert_eq!(
+        alice_reader.read_frame().await.unwrap().unwrap().message,
+        Message::Pong(PongPayload)
+    );
+    carol_writer
+        .write_frame(&Frame::new(Message::Ping(PingPayload)))
+        .await
+        .unwrap();
+    assert_eq!(
+        carol_reader.read_frame().await.unwrap().unwrap().message,
+        Message::Pong(PongPayload)
+    );
+
+    // Bob leaves room 77 -> node-2 dynamically unsubscribes from Redis room 77.
+    bob_writer
+        .write_frame(&Frame::new(Message::LeaveRoom(LeaveRoomPayload {
+            room_id: 77,
+        })))
+        .await
+        .unwrap();
+    assert_eq!(
+        bob_reader.read_frame().await.unwrap().unwrap().message,
+        Message::Ack(AckPayload { message_id: 77 })
+    );
+    assert!(!hub.is_node_subscribed_to_room("node-2", 77));
+
+    drop((
+        alice_writer,
+        alice_reader,
+        bob_writer,
+        bob_reader,
+        carol_writer,
+        carol_reader,
+    ));
+    wait_for_zero_connections(&node1.active_connections).await;
+    wait_for_zero_connections(&node2.active_connections).await;
+
+    node1.shutdown_tx.send(()).unwrap();
+    node2.shutdown_tx.send(()).unwrap();
+    node1.server_handle.await.unwrap().unwrap();
+    node2.server_handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn tcp_cross_node_private_message_and_cluster_offline_fallback() {
+    let storage = Arc::new(InMemoryStorage::new());
+    let hub = InMemoryPubSubHub::default();
+    let pubsub1 = Arc::new(hub.node("node-1"));
+    let pubsub2 = Arc::new(hub.node("node-2"));
+
+    let node1 = spawn_cluster_node(
+        "node-1",
+        storage.clone() as Arc<dyn ChatStorage>,
+        pubsub1.clone() as Arc<dyn PubSubBackend>,
+    )
+    .await;
+    let node2 = spawn_cluster_node(
+        "node-2",
+        storage.clone() as Arc<dyn ChatStorage>,
+        pubsub2.clone() as Arc<dyn PubSubBackend>,
+    )
+    .await;
+
+    let (mut alice_reader, mut alice_writer) =
+        connect_authenticated_client(node1.addr, &node1.auth, "alice").await;
+    let (mut bob_reader, bob_writer) =
+        connect_authenticated_client(node2.addr, &node2.auth, "bob").await;
+
+    // 1. Live cross-node DM: Alice (node-1) -> Bob (node-2). Not buffered offline.
+    let live_dm = PrivateMessagePayload {
+        recipient: "bob".to_string(),
+        message: "cipher-cross-node-live-dm".to_string(),
+    };
+    alice_writer
+        .write_frame(&Frame::new(Message::PrivateMessage(live_dm.clone())))
+        .await
+        .unwrap();
+    match alice_reader.read_frame().await.unwrap().unwrap().message {
+        Message::Ack(ack) => assert_eq!(ack.message_id, 1),
+        other => panic!("expected Ack, got {other:?}"),
+    }
+    assert_eq!(
+        bob_reader.read_frame().await.unwrap().unwrap().message,
+        Message::PrivateMessage(live_dm)
+    );
+    assert_eq!(storage.offline_message_count("bob").await.unwrap(), 0);
+
+    // 2. Bob disconnects from node-2 -> Alice sends another DM -> queued offline.
+    drop((bob_writer, bob_reader));
+    wait_for_zero_connections(&node2.active_connections).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !pubsub1.lookup_user_nodes("bob").await.unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for Bob's node-2 session unregister");
+
+    let offline_dm = PrivateMessagePayload {
+        recipient: "bob".to_string(),
+        message: "cipher-while-bob-offline".to_string(),
+    };
+    alice_writer
+        .write_frame(&Frame::new(Message::PrivateMessage(offline_dm.clone())))
+        .await
+        .unwrap();
+    match alice_reader.read_frame().await.unwrap().unwrap().message {
+        Message::Ack(ack) => assert_eq!(ack.message_id, 2),
+        other => panic!("expected Ack, got {other:?}"),
+    }
+    assert_eq!(storage.offline_message_count("bob").await.unwrap(), 1);
+
+    // 3. Bob reconnects on node-1 -> immediately receives buffered DM right after AuthOk.
+    let (mut bob_n1_reader, bob_n1_writer) =
+        connect_authenticated_client(node1.addr, &node1.auth, "bob").await;
+    assert_eq!(
+        bob_n1_reader.read_frame().await.unwrap().unwrap().message,
+        Message::PrivateMessage(offline_dm)
+    );
+    assert_eq!(storage.offline_message_count("bob").await.unwrap(), 0);
+
+    drop((alice_writer, alice_reader, bob_n1_writer, bob_n1_reader));
+    wait_for_zero_connections(&node1.active_connections).await;
+
+    node1.shutdown_tx.send(()).unwrap();
+    node2.shutdown_tx.send(()).unwrap();
+    node1.server_handle.await.unwrap().unwrap();
+    node2.server_handle.await.unwrap().unwrap();
 }
