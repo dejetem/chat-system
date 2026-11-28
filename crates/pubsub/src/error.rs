@@ -19,4 +19,3 @@ pub enum PubSubError {
     #[error("pubsub broker has been shut down")]
     Closed,
 }
-

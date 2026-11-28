@@ -80,4 +80,3 @@ mod tests {
         assert!(PubSubEnvelope::decode_json("{not valid json").is_err());
     }
 }
-

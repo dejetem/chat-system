@@ -56,4 +56,3 @@ pub trait PubSubBackend: Send + Sync {
     /// Unregisters all remaining local user sessions from the cluster map and stops background listener tasks.
     async fn shutdown(&self) -> Result<(), PubSubError>;
 }
-

@@ -82,4 +82,3 @@ async fn redis_cross_node_room_and_direct_pubsub_and_shutdown_cleanup() {
     assert!(node_a.lookup_user_nodes("bob").await.unwrap().is_empty());
     node_a.shutdown().await.unwrap();
 }
-
