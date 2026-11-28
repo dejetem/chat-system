@@ -65,6 +65,11 @@ impl Config {
 
             redis: RedisConfig {
                 url: env::var("REDIS_URL").expect("REDIS_URL is missing"),
+                key_prefix: non_empty_env("REDIS_KEY_PREFIX").unwrap_or_else(|| "chat".into()),
+                channel_capacity: env::var("REDIS_CHANNEL_CAPACITY")
+                    .unwrap_or_else(|_| "1024".into())
+                    .parse()
+                    .expect("Invalid REDIS_CHANNEL_CAPACITY"),
             },
 
             cluster: ClusterConfig {
